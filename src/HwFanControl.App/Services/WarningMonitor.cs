@@ -183,7 +183,7 @@ public sealed class WarningMonitor : IDisposable
         DateTime now = DateTime.UtcNow;
         string msg = $"Fan failure: {failed} is not spinning (0 RPM).";
         if (ff.DisplayMessageBox)
-            TryMessageBox(_fans, msg, "HwFanControl — Fan Failure Warning", settings.Repeat.MessageBoxMinutes, now);
+            TryMessageBox(_fans, msg, $"{AppVersion.ProductName} — Fan Failure Warning", settings.Repeat.MessageBoxMinutes, now);
         if (ff.WriteToLogfile)
             TryLog(_fans, msg, settings.Repeat.WriteLogfileMinutes, now);
         if (ff.PlaySound)
@@ -208,7 +208,7 @@ public sealed class WarningMonitor : IDisposable
         if (cfg.DisplayMessageBox)
             TryMessageBox(ch,
                 $"{label} temperature {tempCelsius:0.0} °C exceeds warning threshold {cfg.ThresholdCelsius:0.0} °C.",
-                $"HwFanControl — {label} Temperature Warning",
+                $"{AppVersion.ProductName} — {label} Temperature Warning",
                 settings.Repeat.MessageBoxMinutes, now);
         if (cfg.WriteToLogfile)
             TryLog(ch, $"{label} {tempCelsius:0.0} °C >= threshold {cfg.ThresholdCelsius:0.0} °C",

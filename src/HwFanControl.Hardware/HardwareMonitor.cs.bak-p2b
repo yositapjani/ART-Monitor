@@ -1,0 +1,241 @@
+using HwFanControl.Core.Sensors;
+using HwFanControl.Hardware.Adapters;
+using HwFanControl.Hardware.Cpu;
+using HwFanControl.Hardware.Native;
+using HwFanControl.Hardware.Gpu;
+using HwFanControl.Hardware.HdTemp;
+using HwFanControl.Hardware.Mainboard;
+using HwFanControl.Hardware.Overview;
+using HwFanControl.Hardware.Sensors;
+using HwFanControl.Hardware.Smart;
+using LibreHardwareMonitor.Hardware;
+
+namespace HwFanControl.Hardware;
+
+/// <summary>
+/// Owns the LibreHardwareMonitor <see cref="Computer"/> lifecycle, optional native IOCTL driver,
+/// and zero-alloc telemetry polling into a reusable <see cref="SensorSnapshot"/>.
+/// </summary>
+public sealed class HardwareMonitor : IDisposable
+{
+    private readonly INativeIoDriver _nativeDriver;
+    private readonly LibreHardwareBridge _bridge = new();
+    private readonly CpuTelemetry _cpu = new();
+    private readonly OverviewSensors _overview = new();
+    private readonly GpuSensors _gpu = new();
+    private readonly HdTempSensors _hdTemp = new();
+    private readonly SmartSensors _smart = new();
+    private readonly MainboardSensors _mainboard = new();
+    private Computer? _computer;
+    private bool _opened;
+    private bool _disposed;
+    private bool _pollErrorLogged;
+    private int _sequence;
+    private int _consecutiveWriteFailures;
+
+    public HardwareMonitor(INativeIoDriver? nativeDriver = null)
+    {
+        _nativeDriver = nativeDriver ?? new NullNativeIoDriver();
+    }
+
+    public bool IsOpen => _opened && !_disposed;
+    public int FanControlChannelCount => _bridge.ControlCount;
+    public int FanRpmChannelCount => _bridge.FanChannelCount;
+    public INativeIoDriver NativeDriver => _nativeDriver;
+    public CpuTelemetry Cpu => _cpu;
+    public OverviewSensors Overview => _overview;
+    public GpuSensors Gpu => _gpu;
+    public HdTempSensors HdTemp => _hdTemp;
+    public SmartSensors Smart => _smart;
+    public MainboardSensors Mainboard => _mainboard;
+
+    /// <summary>
+    /// Opens hardware backends, scans once, and binds sensors to stable slots.
+    /// Prefer running the host elevated for SuperIO / MSR visibility.
+    /// </summary>
+    public void Open()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (_opened)
+            return;
+
+        _computer = new Computer
+        {
+            IsCpuEnabled = true,
+            IsGpuEnabled = true,
+            IsMotherboardEnabled = true,
+            IsControllerEnabled = true,
+            IsMemoryEnabled = false,
+            IsNetworkEnabled = false,
+            IsStorageEnabled = true,
+        };
+
+        try
+        {
+            _computer.Open();
+            _bridge.Bind(_computer);
+            _cpu.Bind(_computer);
+            _overview.Bind(_computer);
+            _gpu.Bind(_computer);
+            _hdTemp.Bind(_computer);
+            _smart.Bind(_computer);
+            _mainboard.Bind(_computer);
+            _opened = true;
+            _pollErrorLogged = false;
+            _consecutiveWriteFailures = 0;
+        }
+        catch
+        {
+            try { _computer.Close(); } catch { /* ignore */ }
+            _computer = null;
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Polls bound sensors into <paramref name="snapshot"/>. Reuses the embedded buffer;
+    /// does not allocate on the happy path. Marks the snapshot stale on failure instead of throwing.
+    /// </summary>
+    public void Poll(ref SensorSnapshot snapshot)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        if (snapshot.Buffer is null)
+            snapshot.Buffer = new TelemetryBuffer();
+
+        TelemetryBuffer buffer = snapshot.Buffer;
+        buffer.Clear();
+        buffer.TimestampUtcTicks = DateTime.UtcNow.Ticks;
+        buffer.Sequence = ++_sequence;
+
+        if (!_opened || _computer is null)
+        {
+            buffer.IsStale = true;
+            return;
+        }
+
+        try
+        {
+            _bridge.UpdateBoundHardware(_computer);
+            _bridge.PollInto(buffer);
+            _cpu.Poll();
+            _overview.Poll();
+            _gpu.Poll();
+            _hdTemp.Poll();
+            _smart.Poll();
+            _mainboard.Poll();
+            buffer.IsStale = false;
+            _pollErrorLogged = false;
+        }
+        catch (Exception ex)
+        {
+            buffer.IsStale = true;
+            if (!_pollErrorLogged)
+            {
+                System.Diagnostics.Trace.TraceError(
+                    "HardwareMonitor.Poll failed: {0}", ex.Message);
+                _pollErrorLogged = true;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Sets software PWM (0–100%) on a SuperIO control channel.
+    /// Returns false on missing channel or repeated IO failure (caller should fail closed to BIOS).
+    /// </summary>
+    public bool TrySetFanPwm(int channel, float percent)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (!_opened)
+            return false;
+
+        try
+        {
+            bool ok = _bridge.TrySetFanPwm(channel, percent);
+            if (ok)
+            {
+                _consecutiveWriteFailures = 0;
+                return true;
+            }
+
+            _consecutiveWriteFailures++;
+            return false;
+        }
+        catch (Exception ex)
+        {
+            _consecutiveWriteFailures++;
+            System.Diagnostics.Trace.TraceError(
+                "HardwareMonitor.TrySetFanPwm({0}) failed: {1}", channel, ex.Message);
+
+            if (_consecutiveWriteFailures >= 3)
+                ReleaseControlToBios();
+
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Restores all software fan controls to motherboard BIOS/UEFI auto management.
+    /// Safe to call multiple times; used by the process fail-safe path.
+    /// </summary>
+    public void ReleaseControlToBios()
+    {
+        try
+        {
+            _bridge.ReleaseAllControlsToDefault();
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Trace.TraceError(
+                "HardwareMonitor.ReleaseControlToBios failed: {0}", ex.Message);
+        }
+    }
+
+    /// <summary>Fail-safe helper: restore BIOS control then dispose native + LHM resources.</summary>
+    public void ReleaseControlAndDispose()
+    {
+        try
+        {
+            ReleaseControlToBios();
+        }
+        finally
+        {
+            Dispose();
+        }
+    }
+
+    public void Dispose()
+    {
+        if (_disposed)
+            return;
+
+        try
+        {
+            ReleaseControlToBios();
+        }
+        catch
+        {
+            // Never throw from Dispose.
+        }
+
+        if (_computer is not null)
+        {
+            try { _computer.Close(); }
+            catch { /* ignore */ }
+            _computer = null;
+        }
+
+        try
+        {
+            _nativeDriver.Dispose();
+        }
+        catch
+        {
+            // ignore
+        }
+
+        _opened = false;
+        _disposed = true;
+        GC.SuppressFinalize(this);
+    }
+}

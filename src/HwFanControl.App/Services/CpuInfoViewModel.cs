@@ -1,0 +1,126 @@
+﻿using System.Collections.ObjectModel;
+using HwFanControl.Hardware.Cpu;
+
+namespace HwFanControl.App.Services;
+
+/// <summary>UI-thread bindable mirror of CPU telemetry (Core Temp panel).</summary>
+public sealed class CpuInfoViewModel : ObservableObject
+{
+    private string _model = "—";
+    private string _platform = "—";
+    private string _frequency = "—";
+    private string _effective = "—";
+    private string _vid = "—";
+    private string _revision = "—";
+    private string _cpuId = "—";
+    private string _lithography = "—";
+    private string _tdp = "—";
+    private string _coresText = "—";
+    private string _threadsText = "—";
+    private string _processorLabel = "Processor #0";
+    private string _readingsTitle = "Processor #0: Temperature Readings";
+    private string _status = "";
+    private bool _isAmd;
+    private bool _isIntel;
+    private System.Windows.Visibility _amdLogoVisibility = System.Windows.Visibility.Collapsed;
+    private System.Windows.Visibility _intelLogoVisibility = System.Windows.Visibility.Collapsed;
+
+    public string Model { get => _model; set => Set(ref _model, value); }
+    public string Platform { get => _platform; set => Set(ref _platform, value); }
+    public string Frequency { get => _frequency; set => Set(ref _frequency, value); }
+    public string EffectiveClock { get => _effective; set => Set(ref _effective, value); }
+    public string Vid { get => _vid; set => Set(ref _vid, value); }
+    public string Revision { get => _revision; set => Set(ref _revision, value); }
+    private string _memoryUsage = "-";
+    public string CpuId { get => _cpuId; set => Set(ref _cpuId, value); }
+    public string MemoryUsage { get => _memoryUsage; set => Set(ref _memoryUsage, value); }
+    public string Lithography { get => _lithography; set => Set(ref _lithography, value); }
+    public string Tdp { get => _tdp; set => Set(ref _tdp, value); }
+    public string CoresText { get => _coresText; set => Set(ref _coresText, value); }
+    public string ThreadsText { get => _threadsText; set => Set(ref _threadsText, value); }
+    public string ProcessorLabel { get => _processorLabel; set => Set(ref _processorLabel, value); }
+    public string ReadingsTitle { get => _readingsTitle; set => Set(ref _readingsTitle, value); }
+    public string Status { get => _status; set => Set(ref _status, value); }
+    public bool IsAmd { get => _isAmd; set => Set(ref _isAmd, value); }
+    public bool IsIntel { get => _isIntel; set => Set(ref _isIntel, value); }
+    public System.Windows.Visibility AmdLogoVisibility { get => _amdLogoVisibility; set => Set(ref _amdLogoVisibility, value); }
+    public System.Windows.Visibility IntelLogoVisibility { get => _intelLogoVisibility; set => Set(ref _intelLogoVisibility, value); }
+
+    public ObservableCollection<CpuReadingUiRow> Readings { get; } = new();
+
+    public void ApplySnapshot(CpuUiSnapshot snap)
+    {
+        Model = snap.Model;
+        Platform = snap.Platform;
+        Frequency = snap.Frequency;
+        EffectiveClock = snap.EffectiveClock;
+        Vid = snap.Vid;
+        Revision = snap.Revision;
+        CpuId = snap.CpuId;
+        Lithography = snap.Lithography;
+        Tdp = snap.Tdp;
+        CoresText = $"{snap.CoreCount} Core(s)";
+        ThreadsText = $"{snap.ThreadCount} Thread(s)";
+        ProcessorLabel = snap.ProcessorLabel;
+        ReadingsTitle = $"{snap.ProcessorLabel}: Temperature Readings";
+        Status = snap.Status;
+        IsAmd = snap.IsAmd || snap.Model.Contains("Ryzen", StringComparison.OrdinalIgnoreCase) ||
+                snap.Model.Contains("AMD", StringComparison.OrdinalIgnoreCase);
+        IsIntel = snap.IsIntel || snap.Model.Contains("Intel", StringComparison.OrdinalIgnoreCase);
+        AmdLogoVisibility = IsAmd ? System.Windows.Visibility.Visible : System.Windows.Visibility.Collapsed;
+        IntelLogoVisibility = IsIntel && !IsAmd ? System.Windows.Visibility.Visible : System.Windows.Visibility.Collapsed;
+
+        while (Readings.Count > snap.Rows.Count)
+            Readings.RemoveAt(Readings.Count - 1);
+
+        for (int i = 0; i < snap.Rows.Count; i++)
+        {
+            var src = snap.Rows[i];
+            if (i < Readings.Count)
+            {
+                Readings[i].Update(src);
+            }
+            else
+            {
+                Readings.Add(new CpuReadingUiRow(src));
+            }
+        }
+    }
+}
+
+public sealed class CpuReadingUiRow : ObservableObject
+{
+    private string _label;
+    private string _current;
+    private string _min;
+    private string _max;
+    private string _avg;
+    private string _load;
+
+    public CpuReadingUiRow(CpuUiRow row)
+    {
+        _label = row.Label;
+        _current = row.CurrentText;
+        _min = row.MinText;
+        _max = row.MaxText;
+        _avg = row.AvgText;
+        _load = row.LoadText;
+    }
+
+    public string Label { get => _label; private set => Set(ref _label, value); }
+    public string CurrentText { get => _current; private set => Set(ref _current, value); }
+    public string MinText { get => _min; private set => Set(ref _min, value); }
+    public string MaxText { get => _max; private set => Set(ref _max, value); }
+    public string AvgText { get => _avg; private set => Set(ref _avg, value); }
+    public string LoadText { get => _load; private set => Set(ref _load, value); }
+
+    public void Update(CpuUiRow row)
+    {
+        Label = row.Label;
+        CurrentText = row.CurrentText;
+        MinText = row.MinText;
+        MaxText = row.MaxText;
+        AvgText = row.AvgText;
+        LoadText = row.LoadText;
+    }
+}

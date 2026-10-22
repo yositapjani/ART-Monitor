@@ -1,0 +1,164 @@
+using System.Collections.ObjectModel;
+using System.Windows.Media;
+
+namespace HwFanControl.App.Services;
+
+/// <summary>Rolling history for Argus-style CPU Temp. graph (Cores / CCD / Socket).</summary>
+public sealed class TempGraphModel
+{
+    public const int Capacity = 180; // ~3 min at 1 Hz
+
+    public static readonly Color CoresColor = Color.FromRgb(0x1A, 0x3A, 0x6E);
+    public static readonly Color CcdColor = Color.FromRgb(0xE6, 0x7E, 0x22);
+    public static readonly Color SocketColor = Color.FromRgb(0x5D, 0xAE, 0xE8);
+
+    private readonly Queue<float> _coresHistory = new(Capacity);
+    private readonly Queue<float> _ccdHistory = new(Capacity);
+    private readonly Queue<float> _socketHistory = new(Capacity);
+    private float _minY = 40;
+    private float _maxY = 65;
+    private float _sessionMax = float.NaN;
+    private bool _hasCcd;
+
+    public ObservableCollection<LegendItem> Legend { get; } = new();
+    public string VendorText { get; private set; } = "";
+    public string ModelText { get; private set; } = "";
+    public string MaxTempText { get; private set; } = "Maximum CPU Temperature: —";
+    public float AxisMin => _minY;
+    public float AxisMax => _maxY;
+    public bool HasCcd => _hasCcd;
+
+    public void UpdateIdentity(string model, bool isAmd, bool isIntel)
+    {
+        ModelText = model;
+        VendorText = isAmd ? "AuthenticAMD" : isIntel ? "GenuineIntel" : "CPU";
+    }
+
+    /// <summary>
+    /// Push one sample. <paramref name="ccdCelsius"/> may be NaN when no CCD sensor exists
+    /// (series omitted from legend/graph until a valid reading appears).
+    /// </summary>
+    public void Push(float coresCelsius, float ccdCelsius, float socketCelsius)
+    {
+        Enqueue(_coresHistory, coresCelsius);
+        Enqueue(_socketHistory, socketCelsius);
+
+        bool ccdPresent = !float.IsNaN(ccdCelsius) && ccdCelsius > 0.01f;
+        if (ccdPresent)
+            _hasCcd = true;
+
+        if (_hasCcd)
+            Enqueue(_ccdHistory, ccdCelsius);
+        else
+            _ccdHistory.Clear();
+
+        ConsiderMax(coresCelsius);
+        ConsiderMax(ccdCelsius);
+        ConsiderMax(socketCelsius);
+
+        RebuildLegend(coresCelsius, ccdCelsius, socketCelsius);
+        RecalcAxis();
+    }
+
+    public IReadOnlyList<float> GetCoresSeries() => _coresHistory.ToArray();
+    public IReadOnlyList<float> GetCcdSeries() => _hasCcd ? _ccdHistory.ToArray() : Array.Empty<float>();
+    public IReadOnlyList<float> GetSocketSeries() => _socketHistory.ToArray();
+
+    private void ConsiderMax(float v)
+    {
+        if (float.IsNaN(v) || v <= 0.01f)
+            return;
+        if (float.IsNaN(_sessionMax) || v > _sessionMax)
+            _sessionMax = v;
+    }
+
+    private void RebuildLegend(float cores, float ccd, float socket)
+    {
+        MaxTempText = float.IsNaN(_sessionMax)
+            ? "Maximum CPU Temperature: —"
+            : $"Maximum CPU Temperature: {_sessionMax:0.0} °C";
+
+        EnsureLegendSlot(0, FormatLegend("CPU Cores", cores), CoresColor);
+
+        if (_hasCcd)
+        {
+            EnsureLegendSlot(1, FormatLegend("CPU CCD1", ccd), CcdColor);
+            EnsureLegendSlot(2, FormatLegend("CPU Socket", socket), SocketColor);
+            while (Legend.Count > 3)
+                Legend.RemoveAt(Legend.Count - 1);
+        }
+        else
+        {
+            EnsureLegendSlot(1, FormatLegend("CPU Socket", socket), SocketColor);
+            while (Legend.Count > 2)
+                Legend.RemoveAt(Legend.Count - 1);
+        }
+    }
+
+    private void EnsureLegendSlot(int index, string text, Color color)
+    {
+        var brush = new SolidColorBrush(color);
+        brush.Freeze();
+        if (index < Legend.Count)
+        {
+            Legend[index].Text = text;
+            Legend[index].Brush = brush;
+        }
+        else
+        {
+            Legend.Add(new LegendItem { Text = text, Brush = brush });
+        }
+    }
+
+    private static string FormatLegend(string name, float v) =>
+        float.IsNaN(v) || v <= 0.01f ? $"{name} —" : $"{name} {v:0.0} °C";
+
+    private void RecalcAxis()
+    {
+        float min = float.MaxValue;
+        float max = float.MinValue;
+        void Consider(Queue<float> q)
+        {
+            foreach (float v in q)
+            {
+                if (float.IsNaN(v) || v <= 0.01f)
+                    continue;
+                if (v < min) min = v;
+                if (v > max) max = v;
+            }
+        }
+
+        Consider(_coresHistory);
+        if (_hasCcd)
+            Consider(_ccdHistory);
+        Consider(_socketHistory);
+
+        if (min == float.MaxValue)
+        {
+            _minY = 40;
+            _maxY = 65;
+            return;
+        }
+
+        _minY = MathF.Floor((min - 5) / 5f) * 5f;
+        _maxY = MathF.Ceiling((max + 5) / 5f) * 5f;
+        if (_maxY - _minY < 20)
+            _maxY = _minY + 20;
+    }
+
+    private static void Enqueue(Queue<float> q, float value)
+    {
+        if (q.Count >= Capacity)
+            q.Dequeue();
+        q.Enqueue(value);
+    }
+}
+
+public sealed class LegendItem : ObservableObject
+{
+    private string _text = "";
+    private Brush _brush = Brushes.Gray;
+
+    public string Text { get => _text; set => Set(ref _text, value); }
+    public Brush Brush { get => _brush; set => Set(ref _brush, value); }
+}

@@ -1,0 +1,166 @@
+﻿using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Media;
+using System.Windows.Shapes;
+using HwFanControl.App.Services;
+
+namespace HwFanControl.App.Controls;
+
+public sealed class TempGraphCanvas : Canvas
+{
+    private TempGraphModel? _model;
+
+    public void Bind(TempGraphModel model)
+    {
+        _model = model;
+        Redraw();
+    }
+
+    public void Redraw()
+    {
+        Children.Clear();
+        if (_model is null || ActualWidth < 40 || ActualHeight < 40)
+            return;
+
+        double w = ActualWidth;
+        double h = ActualHeight;
+        double padL = 36, padR = 8, padT = 20, padB = 10;
+        double plotW = w - padL - padR;
+        double plotH = h - padT - padB;
+        float ymin = _model.AxisMin;
+        float ymax = _model.AxisMax;
+        if (ymax <= ymin)
+            ymax = ymin + 20;
+
+        Children.Add(new Rectangle
+        {
+            Width = w,
+            Height = h,
+            Fill = ThemeService.GraphBg,
+        });
+
+        var unit = new TextBlock
+        {
+            Text = _model.UnitLabel,
+            FontSize = 11,
+            Foreground = ThemeService.GraphInk,
+            FontWeight = FontWeights.SemiBold,
+        };
+        SetLeft(unit, padL);
+        SetTop(unit, 2);
+        Children.Add(unit);
+
+        int steps = Math.Max(4, (int)Math.Round((ymax - ymin) / _model.AxisStep));
+        for (int i = 0; i <= steps; i++)
+        {
+            float val = ymin + (ymax - ymin) * i / steps;
+            double y = padT + plotH * (1.0 - (val - ymin) / (ymax - ymin));
+            Children.Add(new Line
+            {
+                X1 = padL,
+                Y1 = y,
+                X2 = w - padR,
+                Y2 = y,
+                Stroke = ThemeService.GraphInk,
+                StrokeThickness = 1,
+                StrokeDashArray = new DoubleCollection { 3, 3 },
+                Opacity = 0.55,
+            });
+            var label = new TextBlock
+            {
+                Text = $"{val:0}",
+                FontSize = 10,
+                Foreground = ThemeService.GraphInk,
+            };
+            SetLeft(label, 4);
+            SetTop(label, y - 7);
+            Children.Add(label);
+        }
+
+        var border = new Rectangle
+        {
+            Width = plotW,
+            Height = plotH,
+            Stroke = ThemeService.GraphInk,
+            StrokeThickness = 1,
+            Fill = Brushes.Transparent,
+        };
+        SetLeft(border, padL);
+        SetTop(border, padT);
+        Children.Add(border);
+
+        DrawSeries(_model.GetCoresSeries(), TempGraphModel.CoresColor, padL, padT, plotW, plotH, ymin, ymax);
+        if (_model.HasCcd)
+            DrawSeries(_model.GetCcdSeries(), TempGraphModel.CcdColor, padL, padT, plotW, plotH, ymin, ymax);
+        DrawSeries(_model.GetSocketSeries(), TempGraphModel.SocketColor, padL, padT, plotW, plotH, ymin, ymax);
+
+        var maxLabel = new TextBlock
+        {
+            Text = _model.MaxTempText,
+            FontSize = 12,
+            Foreground = Brushes.Red,
+            FontWeight = FontWeights.SemiBold,
+        };
+        maxLabel.Measure(new System.Windows.Size(double.PositiveInfinity, double.PositiveInfinity));
+        SetLeft(maxLabel, Math.Max(padL, w - padR - maxLabel.DesiredSize.Width - 4));
+        SetTop(maxLabel, h - padB - maxLabel.DesiredSize.Height - 2);
+        Children.Add(maxLabel);
+    }
+
+    private void DrawSeries(
+        IReadOnlyList<float> series,
+        Color color,
+        double padL,
+        double padT,
+        double plotW,
+        double plotH,
+        float ymin,
+        float ymax)
+    {
+        if (series.Count < 2)
+            return;
+
+        var geo = new StreamGeometry();
+        using (var ctx = geo.Open())
+        {
+            bool started = false;
+            for (int i = 0; i < series.Count; i++)
+            {
+                float v = series[i];
+                if (float.IsNaN(v) || v <= 0.01f)
+                {
+                    started = false;
+                    continue;
+                }
+
+                double x = padL + plotW * i / Math.Max(1, TempGraphModel.Capacity - 1);
+                double y = padT + plotH * (1.0 - (v - ymin) / (ymax - ymin));
+                var pt = new Point(x, y);
+                if (!started)
+                {
+                    ctx.BeginFigure(pt, false, false);
+                    started = true;
+                }
+                else
+                {
+                    ctx.LineTo(pt, true, false);
+                }
+            }
+        }
+
+        geo.Freeze();
+        Children.Add(new Path
+        {
+            Data = geo,
+            Stroke = new SolidColorBrush(color),
+            StrokeThickness = 2.2,
+            Fill = Brushes.Transparent,
+        });
+    }
+
+    protected override void OnRenderSizeChanged(SizeChangedInfo sizeInfo)
+    {
+        base.OnRenderSizeChanged(sizeInfo);
+        Redraw();
+    }
+}

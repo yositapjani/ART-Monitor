@@ -1,0 +1,206 @@
+﻿using HwFanControl.Hardware.Cpu;
+using LibreHardwareMonitor.Hardware;
+
+namespace HwFanControl.Hardware.Gpu;
+
+/// <summary>GPU temperature, load, clocks, and fan sensors for the Argus-style GPU tab.</summary>
+public sealed class GpuSensors
+{
+    private readonly UpdateVisitor _visitor = new();
+    private Computer? _computer;
+
+    private ISensor? _temp;
+    private ISensor? _hotSpot;
+    private ISensor? _load;
+    private ISensor? _coreClock;
+    private ISensor? _memoryClock;
+    private ISensor? _fanControl;
+    private ISensor? _fanRpm;
+
+    private string _gpuName = "GPU";
+    private bool _isAmd;
+    private bool _isNvidia;
+
+    public void Bind(Computer computer)
+    {
+        _computer = computer;
+        _temp = null;
+        _hotSpot = null;
+        _load = null;
+        _coreClock = null;
+        _memoryClock = null;
+        _fanControl = null;
+        _fanRpm = null;
+        _gpuName = "GPU";
+        _isAmd = false;
+        _isNvidia = false;
+
+        computer.Accept(_visitor);
+        foreach (IHardware hw in computer.Hardware)
+            Visit(hw);
+    }
+
+    public void Poll() => _computer?.Accept(_visitor);
+
+    /// <summary>Apply a software fan speed (percent) via the GPU control sensor.</summary>
+    public bool TrySetFanPercent(float percent)
+    {
+        if (_fanControl?.Control is not { } control)
+            return false;
+        try
+        {
+            control.SetSoftware(Math.Clamp(percent, 0f, 100f));
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>Hand fan control back to the GPU BIOS/driver.</summary>
+    public void ReleaseFan()
+    {
+        try
+        {
+            _fanControl?.Control?.SetDefault();
+        }
+        catch
+        {
+            // Best-effort BIOS restore; never throw from fail-safe path.
+        }
+    }
+
+    public GpuSnapshot Capture()
+    {
+        float temp = Read(_temp);
+
+        return new GpuSnapshot
+        {
+            GpuName = _gpuName,
+            IsAmd = _isAmd,
+            IsNvidia = _isNvidia,
+            TemperatureCelsius = temp,
+            HotSpotCelsius = ReadOrZero(_hotSpot),
+            HasHotSpot = _hotSpot is not null,
+            LoadPercent = ReadOrZero(_load),
+            CoreClockMhz = ReadOrZero(_coreClock),
+            MemoryClockMhz = ReadOrZero(_memoryClock),
+            FanPercent = ReadOrZero(_fanControl),
+            FanRpm = ReadOrZero(_fanRpm),
+            HasFan = _fanControl is not null || _fanRpm is not null,
+            HasLoad = _load is not null,
+            HasCoreClock = _coreClock is not null,
+            HasMemoryClock = _memoryClock is not null,
+            HasTemperature = _temp is not null && !float.IsNaN(temp),
+        };
+    }
+
+    private void Visit(IHardware hw)
+    {
+        switch (hw.HardwareType)
+        {
+            case HardwareType.GpuAmd:
+            case HardwareType.GpuNvidia:
+            case HardwareType.GpuIntel:
+                // Prefer first discrete GPU found.
+                if (_temp is not null)
+                    break;
+
+                _gpuName = hw.Name?.Trim() ?? "GPU";
+                _isAmd = hw.HardwareType == HardwareType.GpuAmd;
+                _isNvidia = hw.HardwareType == HardwareType.GpuNvidia;
+
+                foreach (ISensor s in hw.Sensors)
+                    BindSensor(s);
+
+                _temp ??= hw.Sensors.FirstOrDefault(s => s.SensorType == SensorType.Temperature);
+                break;
+        }
+
+        foreach (IHardware sub in hw.SubHardware)
+            Visit(sub);
+    }
+
+    private void BindSensor(ISensor sensor)
+    {
+        string name = sensor.Name ?? "";
+
+        switch (sensor.SensorType)
+        {
+            case SensorType.Temperature:
+                if (Contains(name, "Hot Spot") || Contains(name, "Hotspot") ||
+                    Contains(name, "Junction") || Contains(name, "Tj"))
+                {
+                    _hotSpot ??= sensor;
+                }
+                else if (Contains(name, "Core") || Contains(name, "Edge") ||
+                         Contains(name, "GPU") || Contains(name, "Die"))
+                {
+                    _temp ??= sensor;
+                }
+                break;
+
+            case SensorType.Load:
+                // Prefer GPU core / D3D / "GPU Core"; avoid memory controller load when possible.
+                if (Contains(name, "Core") || Contains(name, "D3D") ||
+                    name.Equals("GPU", StringComparison.OrdinalIgnoreCase) ||
+                    name.Equals("GPU Core", StringComparison.OrdinalIgnoreCase))
+                {
+                    _load ??= sensor;
+                }
+                else if (_load is null && !Contains(name, "Memory") && !Contains(name, "Video"))
+                {
+                    _load = sensor;
+                }
+                break;
+
+            case SensorType.Clock:
+                if (Contains(name, "Memory") || Contains(name, "Mem"))
+                    _memoryClock ??= sensor;
+                else if (Contains(name, "Core") || Contains(name, "Shader") || Contains(name, "GPU"))
+                    _coreClock ??= sensor;
+                else
+                    _coreClock ??= sensor;
+                break;
+
+            case SensorType.Control:
+                if (Contains(name, "Fan") || Contains(name, "GPU"))
+                    _fanControl ??= sensor;
+                break;
+
+            case SensorType.Fan:
+                _fanRpm ??= sensor;
+                break;
+        }
+    }
+
+    private static float Read(ISensor? sensor) =>
+        sensor?.Value is float v ? v : float.NaN;
+
+    private static float ReadOrZero(ISensor? sensor) =>
+        sensor?.Value is float v && !float.IsNaN(v) ? v : 0f;
+
+    private static bool Contains(string haystack, string needle) =>
+        haystack.Contains(needle, StringComparison.OrdinalIgnoreCase);
+}
+
+public sealed class GpuSnapshot
+{
+    public string GpuName { get; init; } = "GPU";
+    public bool IsAmd { get; init; }
+    public bool IsNvidia { get; init; }
+    public float TemperatureCelsius { get; init; } = float.NaN;
+    public float HotSpotCelsius { get; init; }
+    public bool HasHotSpot { get; init; }
+    public float LoadPercent { get; init; }
+    public float CoreClockMhz { get; init; }
+    public float MemoryClockMhz { get; init; }
+    public float FanPercent { get; init; }
+    public float FanRpm { get; init; }
+    public bool HasFan { get; init; }
+    public bool HasLoad { get; init; }
+    public bool HasCoreClock { get; init; }
+    public bool HasMemoryClock { get; init; }
+    public bool HasTemperature { get; init; }
+}

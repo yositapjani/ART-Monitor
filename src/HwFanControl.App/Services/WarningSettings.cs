@@ -1,0 +1,176 @@
+﻿using System.IO;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+
+namespace HwFanControl.App.Services;
+
+/// <summary>Persisted Argus-style warning / sensor alert settings.</summary>
+public sealed class WarningSettings
+{
+    public int Version { get; set; } = 1;
+
+    public SensorWarningConfig Cpu { get; set; } = SensorWarningConfig.CreateDefault(95f);
+
+    public SensorWarningConfig Gpu { get; set; } = SensorWarningConfig.CreateDefault(88f);
+
+    public SensorWarningConfig Drives { get; set; } = SensorWarningConfig.CreateDefault(65f);
+
+    public SensorWarningConfig CpuCores { get; set; } = SensorWarningConfig.CreateDefault(90f);
+
+    public SensorWarningConfig MbTemp { get; set; } = SensorWarningConfig.CreateDefault(80f);
+
+    public FanFailureSettings FanFailure { get; set; } = new();
+
+    public WarningRepeatSettings Repeat { get; set; } = WarningRepeatSettings.CreateDefault();
+
+    public WarningSettings Clone()
+    {
+        string json = JsonSerializer.Serialize(this, WarningSettingsStore.JsonOptions);
+        return JsonSerializer.Deserialize<WarningSettings>(json, WarningSettingsStore.JsonOptions)
+               ?? CreateDefault();
+    }
+
+    public static WarningSettings CreateDefault() => new();
+}
+
+public sealed class SensorWarningConfig
+{
+    public float ThresholdCelsius { get; set; } = 95f;
+    public bool DisplayMessageBox { get; set; }
+    public bool WriteToLogfile { get; set; }
+    public bool PlaySound { get; set; }
+    public string SoundPath { get; set; } = "";
+    public bool SendEmail { get; set; }
+    public string EmailTo { get; set; } = "";
+    public bool RunProgram { get; set; }
+    public string ProgramPath { get; set; } = "";
+    public string ProgramArguments { get; set; } = "";
+    public bool HysteresisEnabled { get; set; }
+    public float HysteresisCelsius { get; set; } = 10f;
+
+    public static SensorWarningConfig CreateDefault(float thresholdCelsius) => new()
+    {
+        ThresholdCelsius = thresholdCelsius,
+        HysteresisCelsius = 10f,
+        DisplayMessageBox = true,
+        WriteToLogfile = true,
+    };
+}
+
+public sealed class WarningRepeatSettings
+{
+    public int MessageBoxMinutes { get; set; } = 1;
+    public int PlaySoundMinutes { get; set; } = 1;
+    public int SendEmailMinutes { get; set; } = 60;
+    public int RunProgramMinutes { get; set; } = 120;
+    public int WriteLogfileMinutes { get; set; } = 2;
+
+    public static WarningRepeatSettings CreateDefault() => new();
+}
+
+public sealed class FanFailureSettings
+{
+    public bool Enabled { get; set; } = true;
+    public bool DisplayMessageBox { get; set; } = true;
+    public bool WriteToLogfile { get; set; } = true;
+    public bool PlaySound { get; set; }
+    public int StallSeconds { get; set; } = 10;
+}
+
+public static class WarningSettingsStore
+{
+    internal static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        WriteIndented = true,
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+    };
+
+    public static string DefaultPath =>
+        Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "HwFanControl",
+            "warnings.json");
+
+    public static string DefaultLogPath =>
+        Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "HwFanControl",
+            "warnings.log");
+
+    public static WarningSettings LoadOrCreate(string? path = null)
+    {
+        path ??= DefaultPath;
+        try
+        {
+            if (File.Exists(path))
+            {
+                string json = File.ReadAllText(path);
+                var settings = JsonSerializer.Deserialize<WarningSettings>(json, JsonOptions);
+                if (settings is not null)
+                {
+                    Normalize(settings);
+                    return settings;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Trace.TraceWarning("WarningSettings load failed: {0}", ex.Message);
+        }
+
+        var created = WarningSettings.CreateDefault();
+        Save(created, path);
+        return created;
+    }
+
+    public static void Save(WarningSettings settings, string? path = null)
+    {
+        ArgumentNullException.ThrowIfNull(settings);
+        path ??= DefaultPath;
+        Normalize(settings);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        string json = JsonSerializer.Serialize(settings, JsonOptions);
+        File.WriteAllText(path, json);
+    }
+
+    private static void NormalizeSensor(SensorWarningConfig cfg)
+    {
+        cfg.ThresholdCelsius = Clamp(cfg.ThresholdCelsius, 0f, 150f);
+        cfg.HysteresisCelsius = Clamp(cfg.HysteresisCelsius, 0f, 50f);
+        cfg.SoundPath ??= "";
+        cfg.EmailTo ??= "";
+        cfg.ProgramPath ??= "";
+        cfg.ProgramArguments ??= "";
+    }
+
+    private static void Normalize(WarningSettings settings)
+    {
+        settings.Cpu ??= SensorWarningConfig.CreateDefault(95f);
+        settings.Gpu ??= SensorWarningConfig.CreateDefault(88f);
+        settings.Drives ??= SensorWarningConfig.CreateDefault(65f);
+        settings.CpuCores ??= SensorWarningConfig.CreateDefault(90f);
+        settings.MbTemp ??= SensorWarningConfig.CreateDefault(80f);
+        settings.FanFailure ??= new FanFailureSettings();
+        settings.Repeat ??= WarningRepeatSettings.CreateDefault();
+
+        NormalizeSensor(settings.Cpu);
+        NormalizeSensor(settings.Gpu);
+        NormalizeSensor(settings.Drives);
+        NormalizeSensor(settings.CpuCores);
+        NormalizeSensor(settings.MbTemp);
+        settings.FanFailure.StallSeconds = ClampInt(settings.FanFailure.StallSeconds, 1, 600);
+
+        settings.Repeat.MessageBoxMinutes = ClampInt(settings.Repeat.MessageBoxMinutes, 0, 24 * 60);
+        settings.Repeat.PlaySoundMinutes = ClampInt(settings.Repeat.PlaySoundMinutes, 0, 24 * 60);
+        settings.Repeat.SendEmailMinutes = ClampInt(settings.Repeat.SendEmailMinutes, 0, 24 * 60);
+        settings.Repeat.RunProgramMinutes = ClampInt(settings.Repeat.RunProgramMinutes, 0, 24 * 60);
+        settings.Repeat.WriteLogfileMinutes = ClampInt(settings.Repeat.WriteLogfileMinutes, 0, 24 * 60);
+    }
+
+    private static float Clamp(float v, float min, float max) =>
+        v < min ? min : v > max ? max : v;
+
+    private static int ClampInt(int v, int min, int max) =>
+        v < min ? min : v > max ? max : v;
+}

@@ -1,0 +1,154 @@
+﻿using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Media;
+using System.Windows.Shapes;
+using HwFanControl.App.Services;
+
+namespace HwFanControl.App.Controls;
+
+public sealed class GpuGraphCanvas : Canvas
+{
+    private GpuViewModel? _model;
+
+    public void Bind(GpuViewModel model)
+    {
+        _model = model;
+        Redraw();
+    }
+
+    public void Redraw()
+    {
+        Children.Clear();
+        if (_model is null || ActualWidth < 40 || ActualHeight < 40)
+            return;
+
+        double w = ActualWidth;
+        double h = ActualHeight;
+        double padL = 32, padR = 6, padT = 18, padB = 6;
+        double plotW = w - padL - padR;
+        double plotH = h - padT - padB;
+        float ymin = _model.AxisMin;
+        float ymax = _model.AxisMax;
+        if (ymax <= ymin) ymax = ymin + 20;
+
+        Children.Add(new Rectangle { Width = w, Height = h, Fill = ThemeService.GraphBg });
+
+        var title = new TextBlock
+        {
+            Text = "°C",
+            FontSize = 11,
+            Foreground = ThemeService.GraphInk,
+            FontWeight = FontWeights.SemiBold,
+        };
+        SetLeft(title, padL);
+        SetTop(title, 2);
+        Children.Add(title);
+
+        // Dashed horizontal grid every 10 units (Argus style).
+        float step = 10f;
+        for (float val = ymin; val <= ymax + 0.01f; val += step)
+        {
+            double y = padT + plotH * (1.0 - (val - ymin) / (ymax - ymin));
+            Children.Add(new Line
+            {
+                X1 = padL,
+                Y1 = y,
+                X2 = w - padR,
+                Y2 = y,
+                Stroke = new SolidColorBrush(Color.FromRgb(0xCC, 0xCC, 0xCC)),
+                StrokeThickness = 1,
+                StrokeDashArray = new DoubleCollection { 3, 3 },
+            });
+            var label = new TextBlock { Text = $"{val:0}", FontSize = 10, Foreground = Brushes.DimGray };
+            SetLeft(label, 4);
+            SetTop(label, y - 7);
+            Children.Add(label);
+        }
+
+        var border = new Rectangle
+        {
+            Width = plotW,
+            Height = plotH,
+            Stroke = ThemeService.GraphInk,
+            StrokeThickness = 1,
+            Fill = Brushes.Transparent,
+        };
+        SetLeft(border, padL);
+        SetTop(border, padT);
+        Children.Add(border);
+
+        foreach (var legend in _model.Legend)
+        {
+            if (!_model.Histories.TryGetValue(legend.Key, out var queue))
+                continue;
+
+            var series = queue.ToArray();
+            var color = ((SolidColorBrush)legend.Brush).Color;
+            DrawSeries(series, color, padL, padT, plotW, plotH, ymin, ymax);
+        }
+
+        var maxLabel = new TextBlock
+        {
+            Text = _model.MaxGpuTempText,
+            FontSize = 12,
+            Foreground = Brushes.Red,
+            FontWeight = FontWeights.Normal,
+        };
+        maxLabel.Measure(new System.Windows.Size(double.PositiveInfinity, double.PositiveInfinity));
+        SetLeft(maxLabel, Math.Max(padL, w - padR - maxLabel.DesiredSize.Width - 8));
+        SetTop(maxLabel, padT + plotH - maxLabel.DesiredSize.Height - 4);
+        Children.Add(maxLabel);
+    }
+
+    private void DrawSeries(
+        float[] series, Color color,
+        double padL, double padT, double plotW, double plotH,
+        float ymin, float ymax)
+    {
+        if (series.Length < 2) return;
+
+        var geo = new StreamGeometry();
+        using (var ctx = geo.Open())
+        {
+            bool started = false;
+            for (int i = 0; i < series.Length; i++)
+            {
+                float v = series[i];
+                if (float.IsNaN(v))
+                {
+                    started = false;
+                    continue;
+                }
+
+                // Clamp to plot so out-of-range clocks stay visible at edges.
+                float clamped = Math.Clamp(v, ymin, ymax);
+                double x = padL + plotW * i / Math.Max(1, GpuViewModel.HistoryCapacity - 1);
+                double y = padT + plotH * (1.0 - (clamped - ymin) / (ymax - ymin));
+                var pt = new Point(x, y);
+                if (!started)
+                {
+                    ctx.BeginFigure(pt, false, false);
+                    started = true;
+                }
+                else
+                {
+                    ctx.LineTo(pt, true, false);
+                }
+            }
+        }
+
+        geo.Freeze();
+        Children.Add(new Path
+        {
+            Data = geo,
+            Stroke = new SolidColorBrush(color),
+            StrokeThickness = 2.2,
+        });
+    }
+
+    protected override void OnRenderSizeChanged(SizeChangedInfo sizeInfo)
+    {
+        base.OnRenderSizeChanged(sizeInfo);
+        Redraw();
+    }
+}

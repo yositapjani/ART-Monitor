@@ -1,0 +1,158 @@
+using HwFanControl.Hardware.Cpu;
+using LibreHardwareMonitor.Hardware;
+
+namespace HwFanControl.Hardware.Overview;
+
+/// <summary>GPU + storage temperatures for the Argus-style Overview tab.</summary>
+public sealed class OverviewSensors
+{
+    private readonly UpdateVisitor _visitor = new();
+    private Computer? _computer;
+    private ISensor? _gpuTemp;
+    private ISensor? _gpuTemp2;
+    private string _gpuName = "GPU";
+    private readonly List<(string Name, ISensor Sensor)> _disks = new();
+
+    public void Bind(Computer computer)
+    {
+        _computer = computer;
+        _gpuTemp = null;
+        _gpuTemp2 = null;
+        _disks.Clear();
+        _gpuName = "GPU";
+
+        computer.Accept(_visitor);
+        foreach (IHardware hw in computer.Hardware)
+            Visit(hw);
+    }
+
+    public void Poll()
+    {
+        _computer?.Accept(_visitor);
+    }
+
+    public OverviewSnapshot Capture(IReadOnlyList<float> coreTempsCelsius)
+    {
+        var pairs = new List<OverviewPairRow>();
+
+        // Core pairs: 1/2, 3/4, ...
+        for (int i = 0; i < coreTempsCelsius.Count; i += 2)
+        {
+            float a = coreTempsCelsius[i];
+            float b = i + 1 < coreTempsCelsius.Count ? coreTempsCelsius[i + 1] : float.NaN;
+            pairs.Add(new OverviewPairRow($"Core {i + 1}/{i + 2}", a, b));
+        }
+
+        float g1 = _gpuTemp?.Value ?? float.NaN;
+        float g2 = _gpuTemp2?.Value ?? float.NaN;
+        pairs.Add(new OverviewPairRow("GPU 1/2", g1, g2));
+
+        for (int i = 0; i < _disks.Count; i += 2)
+        {
+            float a = _disks[i].Sensor.Value ?? float.NaN;
+            float b = i + 1 < _disks.Count ? (_disks[i + 1].Sensor.Value ?? float.NaN) : float.NaN;
+            int n1 = i + 1, n2 = i + 2;
+            pairs.Add(new OverviewPairRow($"HDD {n1}/{n2}", a, b));
+        }
+
+        var series = new List<OverviewSeries>
+        {
+            new("CPU Cores", AverageValid(coreTempsCelsius), ColorIndex: 0),
+            new($"GPU 1 ({_gpuName})", g1, ColorIndex: 1),
+        };
+
+        for (int i = 0; i < _disks.Count; i++)
+            series.Add(new(_disks[i].Name, _disks[i].Sensor.Value ?? float.NaN, ColorIndex: 2 + (i % 8)));
+
+        return new OverviewSnapshot
+        {
+            Pairs = pairs,
+            Series = series,
+            GpuName = _gpuName,
+        };
+    }
+
+    private void Visit(IHardware hw)
+    {
+        switch (hw.HardwareType)
+        {
+            case HardwareType.GpuAmd:
+            case HardwareType.GpuNvidia:
+            case HardwareType.GpuIntel:
+                _gpuName = ShortGpuName(hw.Name);
+                foreach (ISensor s in hw.Sensors)
+                {
+                    if (s.SensorType != SensorType.Temperature)
+                        continue;
+                    string n = s.Name ?? "";
+                    if (n.Contains("Core", StringComparison.OrdinalIgnoreCase) ||
+                        n.Contains("Edge", StringComparison.OrdinalIgnoreCase) ||
+                        n.Contains("GPU", StringComparison.OrdinalIgnoreCase))
+                    {
+                        _gpuTemp ??= s;
+                    }
+                    else if (n.Contains("Hot", StringComparison.OrdinalIgnoreCase) ||
+                             n.Contains("Junction", StringComparison.OrdinalIgnoreCase))
+                    {
+                        _gpuTemp2 ??= s;
+                    }
+                }
+
+                _gpuTemp ??= hw.Sensors.FirstOrDefault(s => s.SensorType == SensorType.Temperature);
+                break;
+
+            case HardwareType.Storage:
+                foreach (ISensor s in hw.Sensors)
+                {
+                    if (s.SensorType == SensorType.Temperature && _disks.Count < 8)
+                        _disks.Add((ShortDiskName(hw.Name), s));
+                }
+                break;
+        }
+
+        foreach (IHardware sub in hw.SubHardware)
+            Visit(sub);
+    }
+
+    private static string ShortGpuName(string? name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+            return "GPU";
+        return name.Replace("AMD ", "", StringComparison.OrdinalIgnoreCase)
+                   .Replace("NVIDIA ", "", StringComparison.OrdinalIgnoreCase)
+                   .Trim();
+    }
+
+    private static string ShortDiskName(string? name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+            return "Disk";
+        return name.Length > 28 ? name[..28] + "…" : name;
+    }
+
+    private static float AverageValid(IReadOnlyList<float> values)
+    {
+        float sum = 0;
+        int n = 0;
+        foreach (float v in values)
+        {
+            if (float.IsNaN(v) || v <= 0.01f)
+                continue;
+            sum += v;
+            n++;
+        }
+
+        return n == 0 ? float.NaN : sum / n;
+    }
+}
+
+public sealed class OverviewSnapshot
+{
+    public List<OverviewPairRow> Pairs { get; init; } = new();
+    public List<OverviewSeries> Series { get; init; } = new();
+    public string GpuName { get; init; } = "GPU";
+}
+
+public readonly record struct OverviewPairRow(string Label, float Left, float Right);
+
+public readonly record struct OverviewSeries(string Name, float ValueCelsius, int ColorIndex);

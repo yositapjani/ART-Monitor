@@ -1,0 +1,169 @@
+﻿using System.ComponentModel;
+using System.IO;
+using System.Text.Json;
+
+namespace HwFanControl.App.Services;
+
+public enum AppLanguage
+{
+    English,
+    Indonesian,
+}
+
+public sealed class LocalizationService : INotifyPropertyChanged
+{
+    private static readonly string PrefPath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+        "ART-Monitor",
+        "language.json");
+
+    public static LocalizationService Instance { get; } = new();
+
+    private AppLanguage _language = AppLanguage.English;
+
+    public event PropertyChangedEventHandler? PropertyChanged;
+    public event Action? LanguageChanged;
+
+    public AppLanguage Language
+    {
+        get => _language;
+        set
+        {
+            if (_language == value)
+                return;
+            _language = value;
+            Save();
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Language)));
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(IsEnglish)));
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(IsIndonesian)));
+            LanguageChanged?.Invoke();
+        }
+    }
+
+    public bool IsEnglish => _language == AppLanguage.English;
+    public bool IsIndonesian => _language == AppLanguage.Indonesian;
+
+    private LocalizationService()
+    {
+        try
+        {
+            if (File.Exists(PrefPath))
+            {
+                var json = File.ReadAllText(PrefPath);
+                using var doc = JsonDocument.Parse(json);
+                if (doc.RootElement.TryGetProperty("language", out var lang) &&
+                    Enum.TryParse<AppLanguage>(lang.GetString(), ignoreCase: true, out var parsed))
+                {
+                    _language = parsed;
+                }
+            }
+        }
+        catch
+        {
+            // default English
+        }
+    }
+
+    public void Save()
+    {
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(PrefPath)!);
+            File.WriteAllText(PrefPath, JsonSerializer.Serialize(new { language = _language.ToString() }));
+        }
+        catch
+        {
+            // ignore
+        }
+    }
+
+    public string T(string key) => _language == AppLanguage.Indonesian
+        ? (Id.TryGetValue(key, out var id) ? id : key)
+        : (En.TryGetValue(key, out var en) ? en : key);
+
+    private static readonly Dictionary<string, string> En = new(StringComparer.Ordinal)
+    {
+        ["Menu.File"] = "_File",
+        ["Menu.SaveProfile"] = "Save profile",
+        ["Menu.Exit"] = "Exit",
+        ["Menu.Options"] = "_Options",
+        ["Menu.ApplyStartup"] = "Apply on startup",
+        ["Menu.Settings"] = "Settings…",
+        ["Menu.Language"] = "Language",
+        ["Menu.Tools"] = "_Tools",
+        ["Menu.PawnIO"] = "Install PawnIO (AMD CPU temps)…",
+        ["Menu.RestoreBios"] = "Restore BIOS fan control",
+        ["Menu.Help"] = "_Help",
+        ["Menu.About"] = "About",
+        ["Lang.English"] = "English",
+        ["Lang.Indonesian"] = "Indonesian",
+        ["Banner.NotElevated"] = "Not elevated. Run as Administrator for full SuperIO sensors / PWM control.",
+        ["Banner.HwError"] = "Failed to open hardware: ",
+        ["Status.Cpu"] = "CPU Usage",
+        ["Status.Ram"] = "RAM Usage",
+        ["Tray.Open"] = "Open",
+        ["Tray.Exit"] = "Exit",
+        ["Tray.Tip"] = "Running in tray. Fan control stays active.",
+        ["About.Title"] = "About",
+        ["About.Body"] = "{0} {1}\nHardware monitor & fan control (LibreHardwareMonitor).",
+        ["Quick.Uptime"] = "Uptime",
+        ["Quick.Ip"] = "IP Address",
+        ["Quick.Download"] = "Download (session)",
+        ["Quick.Upload"] = "Upload (session)",
+        ["Quick.Fan"] = "Fan",
+        ["Quick.Days"] = "days",
+        ["Quick.Hours"] = "hours",
+        ["Quick.Minutes"] = "minutes",
+        ["Section.Disks"] = "Disks",
+        ["Section.Network"] = "Network",
+        ["Msg.BiosRestored"] = "Fan control restored to BIOS/UEFI.",
+        ["Fan.Temps"] = "Temps",
+        ["Fan.ApplyStartup"] = "Apply on startup",
+        ["Fan.Curve"] = "Curve",
+        ["Fan.Manual"] = "Manual",
+        ["ComingSoon"] = "{0} — coming soon",
+    };
+
+    private static readonly Dictionary<string, string> Id = new(StringComparer.Ordinal)
+    {
+        ["Menu.File"] = "_File",
+        ["Menu.SaveProfile"] = "Simpan profile",
+        ["Menu.Exit"] = "Keluar",
+        ["Menu.Options"] = "_Options",
+        ["Menu.ApplyStartup"] = "Terapkan saat startup",
+        ["Menu.Settings"] = "Pengaturan…",
+        ["Menu.Language"] = "Bahasa",
+        ["Menu.Tools"] = "_Tools",
+        ["Menu.PawnIO"] = "Pasang PawnIO (suhu CPU AMD)…",
+        ["Menu.RestoreBios"] = "Kembalikan kontrol fan BIOS",
+        ["Menu.Help"] = "_Help",
+        ["Menu.About"] = "Tentang",
+        ["Lang.English"] = "English",
+        ["Lang.Indonesian"] = "Indonesia",
+        ["Banner.NotElevated"] = "Tidak elevated. Jalankan sebagai Administrator agar sensor SuperIO / kontrol PWM lengkap.",
+        ["Banner.HwError"] = "Gagal membuka hardware: ",
+        ["Status.Cpu"] = "Penggunaan CPU",
+        ["Status.Ram"] = "Penggunaan RAM",
+        ["Tray.Open"] = "Buka",
+        ["Tray.Exit"] = "Keluar",
+        ["Tray.Tip"] = "Berjalan di tray. Kontrol fan tetap aktif.",
+        ["About.Title"] = "Tentang",
+        ["About.Body"] = "{0} {1}\nMonitor hardware & kontrol fan (LibreHardwareMonitor).",
+        ["Quick.Uptime"] = "Uptime",
+        ["Quick.Ip"] = "Alamat IP",
+        ["Quick.Download"] = "Download (sesi)",
+        ["Quick.Upload"] = "Upload (sesi)",
+        ["Quick.Fan"] = "Fan",
+        ["Quick.Days"] = "hari",
+        ["Quick.Hours"] = "jam",
+        ["Quick.Minutes"] = "menit",
+        ["Section.Disks"] = "Disk",
+        ["Section.Network"] = "Jaringan",
+        ["Msg.BiosRestored"] = "Kontrol fan dikembalikan ke BIOS/UEFI.",
+        ["Fan.Temps"] = "Suhu",
+        ["Fan.ApplyStartup"] = "Terapkan saat startup",
+        ["Fan.Curve"] = "Kurva",
+        ["Fan.Manual"] = "Manual",
+        ["ComingSoon"] = "{0} — segera hadir",
+    };
+}

@@ -1,0 +1,22 @@
+<Window x:Class="HwFanControl.App.CurveEditorWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Editor Kurva Fan" Height="480" Width="640"
+        WindowStartupLocation="CenterOwner"
+        Background="{StaticResource BgBrush}">
+  <DockPanel Margin="12">
+    <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,10,0,0">
+      <Button Content="Reset Quiet" Click="Reset_Click"/>
+      <Button Content="Batal" IsCancel="True" Click="Cancel_Click"/>
+      <Button Content="Simpan" IsDefault="True" Click="Ok_Click"/>
+    </StackPanel>
+    <DockPanel DockPanel.Dock="Top" Margin="0,0,0,8">
+      <TextBlock Text="Temp (°C) → PWM (%) — seret titik" VerticalAlignment="Center"/>
+      <ComboBox x:Name="KindBox" Width="120" HorizontalAlignment="Right" SelectionChanged="KindBox_Changed"/>
+    </DockPanel>
+    <Border Background="{StaticResource PanelBrush}" BorderBrush="{StaticResource BorderBrush}" BorderThickness="1">
+      <Canvas x:Name="Plot" Background="#1A1F27" MouseLeftButtonDown="Plot_MouseLeftButtonDown"
+              MouseMove="Plot_MouseMove" MouseLeftButtonUp="Plot_MouseLeftUp" SizeChanged="Plot_SizeChanged"/>
+    </Border>
+  </DockPanel>
+</Window>

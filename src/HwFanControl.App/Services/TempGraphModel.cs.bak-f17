@@ -1,0 +1,181 @@
+﻿using System.Collections.ObjectModel;
+using System.Windows.Media;
+
+namespace HwFanControl.App.Services;
+
+/// <summary>Rolling history for Argus-style CPU Temp. graph (Cores / CCD / Socket).</summary>
+public sealed class TempGraphModel
+{
+    public const int Capacity = 180; // ~3 min at 1 Hz
+
+    public static readonly Color CoresColor = Color.FromRgb(0x2E, 0x6B, 0xD8);
+    public static readonly Color CcdColor = Color.FromRgb(0xE6, 0x7E, 0x22);
+    public static readonly Color SocketColor = Color.FromRgb(0x5D, 0xAE, 0xE8);
+
+    private readonly Queue<float> _coresHistory = new(Capacity);
+    private readonly Queue<float> _ccdHistory = new(Capacity);
+    private readonly Queue<float> _socketHistory = new(Capacity);
+    private float _minY = 40;
+    private float _maxY = 65;
+    private float _sessionMax = float.NaN;
+    private bool _hasCcd;
+
+    public ObservableCollection<LegendItem> Legend { get; } = new();
+    public string VendorText { get; private set; } = "";
+    public string ModelText { get; private set; } = "";
+    public string MaxTempText { get; private set; } = "Maximum CPU Temperature: —";
+    public float AxisMin => _minY;
+    public float AxisMax => _maxY;
+    public bool HasCcd => _hasCcd;
+
+    // --- Display configuration (defaults = CPU temperature behavior) ---
+    public string Series0Name { get; set; } = "CPU Cores";
+    public string Series1Name { get; set; } = "CPU CCD1";
+    public string Series2Name { get; set; } = "CPU Socket";
+    public string MaxCaption { get; set; } = "Maximum CPU Temperature";
+    public string Unit { get; set; } = " °C";
+    public string UnitLabel { get; set; } = "°C";
+    public int ValueDecimals { get; set; } = 1;
+    public float AxisStep { get; set; } = 5f;
+    public float AxisPad { get; set; } = 5f;
+    public float AxisMinRange { get; set; } = 20f;
+    public float DefaultAxisMin { get; set; } = 40f;
+    public float DefaultAxisMax { get; set; } = 65f;
+
+    private string FormatValue(float v) =>
+        v.ToString("F" + ValueDecimals, System.Globalization.CultureInfo.InvariantCulture) + Unit;
+
+    public void UpdateIdentity(string model, bool isAmd, bool isIntel)
+    {
+        ModelText = model;
+        VendorText = isAmd ? "AuthenticAMD" : isIntel ? "GenuineIntel" : "CPU";
+    }
+
+    /// <summary>
+    /// Push one sample. <paramref name="ccdCelsius"/> may be NaN when no CCD sensor exists
+    /// (series omitted from legend/graph until a valid reading appears).
+    /// </summary>
+    public void Push(float coresCelsius, float ccdCelsius, float socketCelsius)
+    {
+        Enqueue(_coresHistory, coresCelsius);
+        Enqueue(_socketHistory, socketCelsius);
+
+        bool ccdPresent = !float.IsNaN(ccdCelsius) && ccdCelsius > 0.01f;
+        if (ccdPresent)
+            _hasCcd = true;
+
+        if (_hasCcd)
+            Enqueue(_ccdHistory, ccdCelsius);
+        else
+            _ccdHistory.Clear();
+
+        ConsiderMax(coresCelsius);
+        ConsiderMax(ccdCelsius);
+        ConsiderMax(socketCelsius);
+
+        RebuildLegend(coresCelsius, ccdCelsius, socketCelsius);
+        RecalcAxis();
+    }
+
+    public IReadOnlyList<float> GetCoresSeries() => _coresHistory.ToArray();
+    public IReadOnlyList<float> GetCcdSeries() => _hasCcd ? _ccdHistory.ToArray() : Array.Empty<float>();
+    public IReadOnlyList<float> GetSocketSeries() => _socketHistory.ToArray();
+
+    private void ConsiderMax(float v)
+    {
+        if (float.IsNaN(v) || v <= 0.01f)
+            return;
+        if (float.IsNaN(_sessionMax) || v > _sessionMax)
+            _sessionMax = v;
+    }
+
+    private void RebuildLegend(float cores, float ccd, float socket)
+    {
+        MaxTempText = float.IsNaN(_sessionMax)
+            ? $"{MaxCaption}: —"
+            : $"{MaxCaption}: {FormatValue(_sessionMax)}";
+
+        EnsureLegendSlot(0, FormatLegend(Series0Name, cores), CoresColor);
+
+        if (_hasCcd)
+        {
+            EnsureLegendSlot(1, FormatLegend(Series1Name, ccd), CcdColor);
+            EnsureLegendSlot(2, FormatLegend(Series2Name, socket), SocketColor);
+            while (Legend.Count > 3)
+                Legend.RemoveAt(Legend.Count - 1);
+        }
+        else
+        {
+            EnsureLegendSlot(1, FormatLegend(Series2Name, socket), SocketColor);
+            while (Legend.Count > 2)
+                Legend.RemoveAt(Legend.Count - 1);
+        }
+    }
+
+    private void EnsureLegendSlot(int index, string text, Color color)
+    {
+        var brush = new SolidColorBrush(color);
+        brush.Freeze();
+        if (index < Legend.Count)
+        {
+            Legend[index].Text = text;
+            Legend[index].Brush = brush;
+        }
+        else
+        {
+            Legend.Add(new LegendItem { Text = text, Brush = brush });
+        }
+    }
+
+    private string FormatLegend(string name, float v) =>
+        float.IsNaN(v) || v <= 0.01f ? $"{name} —" : $"{name} {FormatValue(v)}";
+
+    private void RecalcAxis()
+    {
+        float min = float.MaxValue;
+        float max = float.MinValue;
+        void Consider(Queue<float> q)
+        {
+            foreach (float v in q)
+            {
+                if (float.IsNaN(v) || v <= 0.01f)
+                    continue;
+                if (v < min) min = v;
+                if (v > max) max = v;
+            }
+        }
+
+        Consider(_coresHistory);
+        if (_hasCcd)
+            Consider(_ccdHistory);
+        Consider(_socketHistory);
+
+        if (min == float.MaxValue)
+        {
+            _minY = DefaultAxisMin;
+            _maxY = DefaultAxisMax;
+            return;
+        }
+
+        _minY = MathF.Floor((min - AxisPad) / AxisStep) * AxisStep;
+        _maxY = MathF.Ceiling((max + AxisPad) / AxisStep) * AxisStep;
+        if (_maxY - _minY < AxisMinRange)
+            _maxY = _minY + AxisMinRange;
+    }
+
+    private static void Enqueue(Queue<float> q, float value)
+    {
+        if (q.Count >= Capacity)
+            q.Dequeue();
+        q.Enqueue(value);
+    }
+}
+
+public sealed class LegendItem : ObservableObject
+{
+    private string _text = "";
+    private Brush _brush = Brushes.Gray;
+
+    public string Text { get => _text; set => Set(ref _text, value); }
+    public Brush Brush { get => _brush; set => Set(ref _brush, value); }
+}

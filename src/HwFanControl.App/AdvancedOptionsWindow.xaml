@@ -1,0 +1,49 @@
+<Window x:Class="HwFanControl.App.AdvancedOptionsWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Opsi Lanjutan Fan" Height="360" Width="420"
+        WindowStartupLocation="CenterOwner"
+        Background="{StaticResource BgBrush}">
+  <DockPanel Margin="14">
+    <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
+      <Button Content="Batal" IsCancel="True" Click="Cancel_Click"/>
+      <Button Content="Simpan" IsDefault="True" Click="Ok_Click"/>
+    </StackPanel>
+    <Grid>
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="2*"/>
+        <ColumnDefinition Width="*"/>
+      </Grid.ColumnDefinitions>
+      <Grid.RowDefinitions>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+      </Grid.RowDefinitions>
+
+      <TextBlock Text="Nama channel" VerticalAlignment="Center"/>
+      <TextBox x:Name="NameBox" Grid.Column="1" Margin="0,4"/>
+
+      <TextBlock Grid.Row="1" Text="Min PWM aman (%)" VerticalAlignment="Center"/>
+      <TextBox x:Name="MinPwm" Grid.Row="1" Grid.Column="1" Margin="0,4"/>
+
+      <TextBlock Grid.Row="2" Text="Kickstart PWM (%)" VerticalAlignment="Center"/>
+      <TextBox x:Name="KickPwm" Grid.Row="2" Grid.Column="1" Margin="0,4"/>
+
+      <TextBlock Grid.Row="3" Text="Kickstart durasi (detik)" VerticalAlignment="Center"/>
+      <TextBox x:Name="KickDur" Grid.Row="3" Grid.Column="1" Margin="0,4"/>
+
+      <TextBlock Grid.Row="4" Text="Rate naik (%/detik)" VerticalAlignment="Center"/>
+      <TextBox x:Name="RateUp" Grid.Row="4" Grid.Column="1" Margin="0,4"/>
+
+      <TextBlock Grid.Row="5" Text="Rate turun (%/detik)" VerticalAlignment="Center"/>
+      <TextBox x:Name="RateDown" Grid.Row="5" Grid.Column="1" Margin="0,4"/>
+
+      <TextBlock Grid.Row="6" Text="Hysteresis suhu (°C)" VerticalAlignment="Center"/>
+      <TextBox x:Name="Hyst" Grid.Row="6" Grid.Column="1" Margin="0,4"/>
+    </Grid>
+  </DockPanel>
+</Window>

@@ -1,0 +1,190 @@
+﻿using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Media;
+using System.Windows.Shapes;
+using HwFanControl.App.Services;
+
+namespace HwFanControl.App.Controls;
+
+/// <summary>Argus System graph: white plot, fixed/dynamic Y axis, single red history line.</summary>
+public sealed class SystemGraphCanvas : Canvas
+{
+    private SystemViewModel? _model;
+
+    public void Bind(SystemViewModel model)
+    {
+        _model = model;
+        Redraw();
+    }
+
+    public void Redraw()
+    {
+        Children.Clear();
+        if (_model is null || ActualWidth < 40 || ActualHeight < 40)
+            return;
+
+        double w = ActualWidth;
+        double h = ActualHeight;
+        double padL = 36, padR = 8, padT = 18, padB = 8;
+        double plotW = w - padL - padR;
+        double plotH = h - padT - padB;
+        float ymin = _model.AxisMin;
+        float ymax = _model.AxisMax;
+        if (ymax <= ymin)
+            ymax = ymin + 20;
+
+        Children.Add(new Rectangle { Width = w, Height = h, Fill = ThemeService.GraphBg });
+
+        var unit = new TextBlock
+        {
+            Text = _model.AxisUnit,
+            FontSize = 11,
+            Foreground = ThemeService.GraphInk,
+            FontWeight = FontWeights.SemiBold,
+        };
+        SetLeft(unit, padL);
+        SetTop(unit, 2);
+        Children.Add(unit);
+
+        // Prefer Argus CPU-style ticks at 20/40/60/80/100 when axis is 0–100 %.
+        float[] ticks;
+        if (Math.Abs(ymin) < 0.01f && Math.Abs(ymax - 100f) < 0.01f && _model.AxisUnit == "%")
+            ticks = [20, 40, 60, 80, 100];
+        else
+        {
+            int steps = 5;
+            ticks = new float[steps];
+            for (int i = 0; i < steps; i++)
+                ticks[i] = ymin + (ymax - ymin) * (i + 1) / steps;
+        }
+
+        foreach (float val in ticks)
+        {
+            double y = padT + plotH * (1.0 - (val - ymin) / (ymax - ymin));
+            Children.Add(new Line
+            {
+                X1 = padL,
+                Y1 = y,
+                X2 = w - padR,
+                Y2 = y,
+                Stroke = ThemeService.GraphInk,
+                StrokeThickness = 1,
+                StrokeDashArray = new DoubleCollection { 3, 3 },
+            });
+            var label = new TextBlock
+            {
+                Text = FormatTick(val),
+                FontSize = 10,
+                Foreground = ThemeService.GraphInk,
+            };
+            SetLeft(label, 4);
+            SetTop(label, y - 7);
+            Children.Add(label);
+        }
+
+        // Solid baseline at ymin (0).
+        double y0 = padT + plotH;
+        Children.Add(new Line
+        {
+            X1 = padL,
+            Y1 = y0,
+            X2 = w - padR,
+            Y2 = y0,
+            Stroke = ThemeService.GraphInk,
+            StrokeThickness = 1,
+        });
+        var zero = new TextBlock { Text = FormatTick(ymin), FontSize = 10, Foreground = ThemeService.GraphInk };
+        SetLeft(zero, 4);
+        SetTop(zero, y0 - 7);
+        Children.Add(zero);
+
+        var border = new Rectangle
+        {
+            Width = plotW,
+            Height = plotH,
+            Stroke = ThemeService.GraphInk,
+            StrokeThickness = 1,
+            Fill = Brushes.Transparent,
+        };
+        SetLeft(border, padL);
+        SetTop(border, padT);
+        Children.Add(border);
+
+        if (_model.IsPlaceholder)
+        {
+            var placeholder = new TextBlock
+            {
+                Text = "Coming soon",
+                FontSize = 16,
+                Foreground = new SolidColorBrush(Color.FromRgb(0x55, 0x55, 0x55)),
+            };
+            placeholder.Measure(new System.Windows.Size(double.PositiveInfinity, double.PositiveInfinity));
+            SetLeft(placeholder, padL + (plotW - placeholder.DesiredSize.Width) / 2);
+            SetTop(placeholder, padT + (plotH - placeholder.DesiredSize.Height) / 2);
+            Children.Add(placeholder);
+            return;
+        }
+
+        var series = _model.GetActiveSeries();
+        DrawSeries(series, SystemViewModel.LineColor, padL, padT, plotW, plotH, ymin, ymax);
+    }
+
+    private void DrawSeries(
+        IReadOnlyList<float> series,
+        Color color,
+        double padL,
+        double padT,
+        double plotW,
+        double plotH,
+        float ymin,
+        float ymax)
+    {
+        if (series.Count < 2)
+            return;
+
+        var geo = new StreamGeometry();
+        using (var ctx = geo.Open())
+        {
+            bool started = false;
+            for (int i = 0; i < series.Count; i++)
+            {
+                float v = series[i];
+                if (float.IsNaN(v))
+                {
+                    started = false;
+                    continue;
+                }
+
+                double x = padL + plotW * i / Math.Max(1, SystemViewModel.HistoryCapacity - 1);
+                double y = padT + plotH * (1.0 - (v - ymin) / (ymax - ymin));
+                var pt = new Point(x, y);
+                if (!started)
+                {
+                    ctx.BeginFigure(pt, false, false);
+                    started = true;
+                }
+                else
+                {
+                    ctx.LineTo(pt, true, false);
+                }
+            }
+        }
+
+        geo.Freeze();
+        Children.Add(new Path
+        {
+            Data = geo,
+            Stroke = new SolidColorBrush(color),
+            StrokeThickness = 2.2,
+        });
+    }
+
+    private static string FormatTick(float val) =>
+        Math.Abs(val - MathF.Round(val)) < 0.05f ? $"{val:0}" : $"{val:0.#}";
+
+    protected override void OnRenderSizeChanged(SizeChangedInfo sizeInfo)
+    {
+        base.OnRenderSizeChanged(sizeInfo);
+        Redraw();
+    }
+}

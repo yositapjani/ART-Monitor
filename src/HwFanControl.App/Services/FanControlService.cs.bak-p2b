@@ -1,0 +1,498 @@
+using System.Collections.ObjectModel;
+using HwFanControl.Core;
+using HwFanControl.Core.Config;
+using HwFanControl.Core.Curves;
+using HwFanControl.Core.Safety;
+using HwFanControl.Core.Sensors;
+using HwFanControl.Hardware;
+using HwFanControl.Hardware.Cpu;
+using HwFanControl.Hardware.Gpu;
+using HwFanControl.Hardware.Overview;
+using HwFanControl.Hardware.Sensors;
+using HwFanControl.Hardware.Smart;
+
+namespace HwFanControl.App.Services;
+
+public sealed class FanControlService : IDisposable
+{
+    public const int PollIntervalMs = 1000;
+
+    private readonly HardwareMonitor _monitor = new();
+    private readonly FanLogicController _logic = new();
+    private readonly FailSafeHooks _hooks;
+    private readonly float[] _pwmOut = new float[FanLogicController.MaxFanChannels];
+    private readonly object _gate = new();
+    private CancellationTokenSource? _cts;
+    private Task? _loop;
+    private FanProfile _profile;
+    private SensorSnapshot _snapshot = SensorSnapshot.Create();
+    private bool _opened;
+    private bool _disposed;
+    private string? _lastError;
+
+    public FanControlService()
+    {
+        _hooks = new FailSafeHooks(() =>
+        {
+            try { _monitor.ReleaseControlToBios(); } catch { /* ignore */ }
+        });
+        _profile = FanProfile.CreateDefault();
+    }
+
+    public FanLogicController Logic => _logic;
+    public FanProfile Profile => _profile;
+    public bool IsHardwareOpen => _opened;
+    public bool IsElevated { get; private set; }
+    public string? LastError => _lastError;
+    public int FanControlCount => _monitor.FanControlChannelCount;
+    public int FanRpmCount => _monitor.FanRpmChannelCount;
+    public CpuTelemetry Cpu => _monitor.Cpu;
+    public CpuInfoViewModel CpuInfo { get; } = new();
+    public OverviewViewModel Overview { get; } = new();
+    public GpuViewModel Gpu { get; } = new();
+    public HdTempViewModel HdTemp { get; } = new();
+    public SmartViewModel Smart { get; } = new();
+    public MainboardViewModel Mainboard { get; } = new();
+    public SystemViewModel SystemVm { get; } = new();
+
+    public ObservableCollection<TempRow> Temperatures { get; } = new();
+    public ObservableCollection<FanRow> Fans { get; } = new();
+
+    public event Action? UiTick;
+
+    public void Start()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        IsElevated = Elevation.IsProcessElevated();
+        _hooks.Register(attachConsoleEvents: false);
+        _hooks.ResetRestoredFlag();
+
+        _profile = FanProfileStore.LoadOrCreate();
+        _logic.LoadChannels(_profile.Channels);
+        RebuildUiRows();
+
+        try
+        {
+            _monitor.Open();
+            _opened = true;
+            _lastError = null;
+
+            int visible = Math.Max(_monitor.FanControlChannelCount, _monitor.FanRpmChannelCount);
+            if (visible <= 0)
+                visible = FanLogicController.MaxFanChannels;
+
+            for (int i = 0; i < FanLogicController.MaxFanChannels; i++)
+            {
+                var ch = _logic.GetChannel(i);
+                ch.Show = i < visible;
+
+                // If global/channel apply-on-startup is off, leave channel disabled until user enables.
+                if (!_profile.ApplyOnStartupGlobal || !ch.ApplyOnStartup)
+                    ch.Mode = FanChannelMode.Disabled;
+            }
+
+            RebuildUiRows();
+        }
+        catch (Exception ex)
+        {
+            _opened = false;
+            _lastError = ex.Message;
+        }
+
+        _cts = new CancellationTokenSource();
+        _loop = Task.Run(() => PollLoopAsync(_cts.Token));
+    }
+
+    public void SaveProfile()
+    {
+        SyncProfileFromLogic();
+        FanProfileStore.Save(_profile);
+    }
+
+    public void ApplyChannel(FanChannelConfig config)
+    {
+        _logic.SetChannelConfig(config);
+        SyncProfileFromLogic();
+        FanProfileStore.Save(_profile);
+    }
+
+    public void EmergencyRestore() => _hooks.EmergencyRestore();
+
+    private async Task PollLoopAsync(CancellationToken token)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(PollIntervalMs));
+        try
+        {
+            while (await timer.WaitForNextTickAsync(token))
+            {
+                TickOnce();
+                UiTick?.Invoke();
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // shutdown
+        }
+    }
+
+    private void TickOnce()
+    {
+        if (!_opened)
+            return;
+
+        lock (_gate)
+        {
+            _monitor.Poll(ref _snapshot);
+            if (_snapshot.Buffer.IsStale)
+                return;
+
+            _logic.Evaluate(_snapshot.Buffer, _pwmOut.AsSpan(), DateTimeOffset.UtcNow);
+
+            for (int ch = 0; ch < FanLogicController.MaxFanChannels; ch++)
+            {
+                var cfg = _logic.GetChannel(ch);
+                if (cfg.Mode == FanChannelMode.Disabled)
+                    continue;
+                if (ch >= _monitor.FanControlChannelCount)
+                    continue;
+
+                float pwm = _pwmOut[ch];
+                if (float.IsNaN(pwm))
+                    continue;
+
+                _monitor.TrySetFanPwm(ch, pwm);
+            }
+
+            UpdateRows(_snapshot.Buffer, _pwmOut);
+            // CPU snapshot is applied on the UI thread via UiTick → ApplyCpuToUi().
+        }
+    }
+
+    public void ApplyCpuToUi()
+    {
+        if (!_opened)
+            return;
+        CpuInfo.ApplySnapshot(_monitor.Cpu.Capture());
+    }
+
+    public void ApplyOverviewToUi()
+    {
+        if (!_opened)
+            return;
+
+        var cores = new List<float>();
+        foreach (var row in CpuInfo.Readings)
+        {
+            if (!row.Label.StartsWith("Core #", StringComparison.OrdinalIgnoreCase))
+                continue;
+            cores.Add(ParseTempC(row.CurrentText));
+        }
+
+        Overview.Apply(_monitor.Overview.Capture(cores));
+    }
+
+    public void ApplyGpuToUi()
+    {
+        if (!_opened)
+            return;
+        Gpu.Apply(_monitor.Gpu.Capture());
+    }
+
+    public void ApplyHdTempToUi()
+    {
+        if (!_opened)
+            return;
+        HdTemp.Apply(_monitor.HdTemp.Capture());
+    }
+
+    public void ApplySmartToUi()
+    {
+        if (!_opened)
+            return;
+        Smart.Apply(_monitor.Smart.Capture());
+    }
+
+    public void ApplyMainboardToUi()
+    {
+        if (!_opened)
+            return;
+        Mainboard.Apply(_monitor.Mainboard.Capture());
+    }
+
+    public void ApplySystemToUi()
+    {
+        SystemVm.Push(AverageCoreLoadPercent());
+    }
+
+    private float AverageCoreLoadPercent()
+    {
+        float sum = 0;
+        int n = 0;
+        foreach (var row in CpuInfo.Readings)
+        {
+            if (!row.Label.StartsWith("Core #", StringComparison.OrdinalIgnoreCase))
+                continue;
+            if (row.LoadText is null || row.LoadText == "—")
+                continue;
+            string s = row.LoadText.Replace("%", "").Trim();
+            if (float.TryParse(s, global::System.Globalization.NumberStyles.Float,
+                    global::System.Globalization.CultureInfo.InvariantCulture, out float v))
+            {
+                sum += v;
+                n++;
+            }
+        }
+
+        return n == 0 ? float.NaN : sum / n;
+    }
+
+    private static float ParseTempC(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text) || text is "—" or "---")
+            return float.NaN;
+        string num = text.Replace("°C", "", StringComparison.OrdinalIgnoreCase).Trim();
+        return float.TryParse(num, global::System.Globalization.NumberStyles.Float,
+            global::System.Globalization.CultureInfo.InvariantCulture, out float v)
+            ? v
+            : float.NaN;
+    }
+
+    private void RebuildUiRows()
+    {
+        Temperatures.Clear();
+        foreach (var t in _profile.TemperatureChannels.Where(x => x.Show))
+            Temperatures.Add(new TempRow { Id = t.Id, Name = t.DisplayName, Source = t.Source });
+
+        Fans.Clear();
+        foreach (var ch in _logic.Channels.Where(c => c.Show))
+        {
+            Fans.Add(new FanRow
+            {
+                ChannelIndex = ch.ChannelIndex,
+                Name = ch.Name,
+                Mode = ch.Mode,
+                ManualPwm = ch.ManualPwmPercent,
+                Source = ch.TemperatureSource,
+                ApplyOnStartup = ch.ApplyOnStartup,
+            });
+        }
+    }
+
+    private void UpdateRows(TelemetryBuffer buf, float[] pwm)
+    {
+        foreach (var row in Temperatures)
+        {
+            row.ValueCelsius = ResolveTemp(buf, row.Source);
+            row.HasValue = !float.IsNaN(row.ValueCelsius);
+        }
+
+        foreach (var row in Fans)
+        {
+            int i = row.ChannelIndex;
+            var cfg = _logic.GetChannel(i);
+            row.Name = cfg.Name;
+            row.Mode = cfg.Mode;
+            row.ManualPwm = cfg.ManualPwmPercent;
+            row.Source = cfg.TemperatureSource;
+            row.ApplyOnStartup = cfg.ApplyOnStartup;
+            row.OutputPwm = float.IsNaN(pwm[i]) ? 0 : pwm[i];
+
+            var rpmSlot = SensorSlot.FanRpm0 + i;
+            if (buf.TryGet(rpmSlot, out float rpm))
+            {
+                row.Rpm = rpm;
+                row.HasRpm = true;
+            }
+            else
+            {
+                row.HasRpm = false;
+            }
+        }
+    }
+
+    private static float ResolveTemp(TelemetryBuffer buf, TemperatureSourceKind source)
+    {
+        return source switch
+        {
+            TemperatureSourceKind.CpuPackage => Get(buf, SensorSlot.CpuPackageTemp, SensorSlot.CpuCoreTempMax),
+            TemperatureSourceKind.CpuCoreMax => Get(buf, SensorSlot.CpuCoreTempMax, SensorSlot.CpuPackageTemp),
+            TemperatureSourceKind.GpuEdge => Get(buf, SensorSlot.GpuEdgeTemp),
+            TemperatureSourceKind.GpuJunction => Get(buf, SensorSlot.GpuJunctionTemp, SensorSlot.GpuEdgeTemp),
+            TemperatureSourceKind.GpuHotspot => Get(buf, SensorSlot.GpuHotspotTemp, SensorSlot.GpuJunctionTemp, SensorSlot.GpuEdgeTemp),
+            TemperatureSourceKind.Ambient => Get(buf, SensorSlot.AmbientTemp),
+            TemperatureSourceKind.AvgCpuGpu => Avg(Get(buf, SensorSlot.CpuPackageTemp, SensorSlot.CpuCoreTempMax), Get(buf, SensorSlot.GpuEdgeTemp)),
+            TemperatureSourceKind.MaxCpuGpu => Max(Get(buf, SensorSlot.CpuPackageTemp, SensorSlot.CpuCoreTempMax), Get(buf, SensorSlot.GpuEdgeTemp)),
+            _ => float.NaN,
+        };
+    }
+
+    private static float Get(TelemetryBuffer buf, params SensorSlot[] slots)
+    {
+        foreach (var s in slots)
+        {
+            if (buf.TryGet(s, out float v))
+                return v;
+        }
+
+        return float.NaN;
+    }
+
+    private static float Avg(float a, float b) =>
+        float.IsNaN(a) || float.IsNaN(b) ? float.NaN : (a + b) * 0.5f;
+
+    private static float Max(float a, float b) =>
+        float.IsNaN(a) || float.IsNaN(b) ? float.NaN : global::System.Math.Max(a, b);
+
+    private void SyncProfileFromLogic()
+    {
+        _profile.Channels = _logic.Channels.Select(CloneChannel).ToList();
+    }
+
+    private static FanChannelConfig CloneChannel(FanChannelConfig c)
+    {
+        // Profile holds same references as logic for simplicity; ensure list is current.
+        return c;
+    }
+
+    public void Dispose()
+    {
+        if (_disposed)
+            return;
+
+        try
+        {
+            _cts?.Cancel();
+            _loop?.Wait(TimeSpan.FromSeconds(2));
+        }
+        catch { /* ignore */ }
+
+        try { SaveProfile(); } catch { /* ignore */ }
+
+        _hooks.Dispose();
+        SystemVm.Dispose();
+        _monitor.Dispose();
+        _disposed = true;
+        GC.SuppressFinalize(this);
+    }
+}
+
+public static class Elevation
+{
+    public static bool IsProcessElevated()
+    {
+        try
+        {
+            using var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
+            var principal = new System.Security.Principal.WindowsPrincipal(identity);
+            return principal.IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+}
+
+public sealed class TempRow : ObservableObject
+{
+    private string _name = "";
+    private float _value;
+    private bool _hasValue;
+    private string _display = "—";
+
+    public string Id { get; set; } = "";
+    public TemperatureSourceKind Source { get; set; }
+
+    public string Name { get => _name; set => Set(ref _name, value); }
+
+    public float ValueCelsius
+    {
+        get => _value;
+        set
+        {
+            if (Set(ref _value, value))
+                DisplayValue = HasValue ? $"{_value:0.0} °C" : "—";
+        }
+    }
+
+    public bool HasValue
+    {
+        get => _hasValue;
+        set
+        {
+            if (Set(ref _hasValue, value))
+                DisplayValue = value ? $"{_value:0.0} °C" : "—";
+        }
+    }
+
+    public string DisplayValue { get => _display; private set => Set(ref _display, value); }
+}
+
+public sealed class FanRow : ObservableObject
+{
+    private string _name = "";
+    private FanChannelMode _mode;
+    private float _manual;
+    private float _output;
+    private float _rpm;
+    private bool _hasRpm;
+    private TemperatureSourceKind _source;
+    private bool _applyOnStartup;
+    private string _rpmText = "—";
+    private string _outputText = "0%";
+
+    public int ChannelIndex { get; set; }
+
+    public string Name { get => _name; set => Set(ref _name, value); }
+    public FanChannelMode Mode { get => _mode; set => Set(ref _mode, value); }
+    public float ManualPwm { get => _manual; set => Set(ref _manual, value); }
+    public TemperatureSourceKind Source { get => _source; set => Set(ref _source, value); }
+    public bool ApplyOnStartup { get => _applyOnStartup; set => Set(ref _applyOnStartup, value); }
+
+    public float OutputPwm
+    {
+        get => _output;
+        set
+        {
+            if (Set(ref _output, value))
+                OutputText = $"{value:0}%";
+        }
+    }
+
+    public float Rpm
+    {
+        get => _rpm;
+        set
+        {
+            if (Set(ref _rpm, value))
+                RpmText = HasRpm ? $"{value:0} RPM" : "—";
+        }
+    }
+
+    public bool HasRpm
+    {
+        get => _hasRpm;
+        set
+        {
+            if (Set(ref _hasRpm, value))
+                RpmText = value ? $"{_rpm:0} RPM" : "—";
+        }
+    }
+
+    public string RpmText { get => _rpmText; private set => Set(ref _rpmText, value); }
+    public string OutputText { get => _outputText; private set => Set(ref _outputText, value); }
+}
+
+public abstract class ObservableObject : System.ComponentModel.INotifyPropertyChanged
+{
+    public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
+
+    protected bool Set<T>(ref T field, T value, [System.Runtime.CompilerServices.CallerMemberName] string? name = null)
+    {
+        if (Equals(field, value))
+            return false;
+        field = value;
+        PropertyChanged?.Invoke(this, new System.ComponentModel.PropertyChangedEventArgs(name));
+        return true;
+    }
+}

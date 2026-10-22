@@ -1,0 +1,910 @@
+﻿using System.ComponentModel;
+using System.Runtime.CompilerServices;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
+using System.Windows.Threading;
+using HwFanControl.App.Services;
+using HwFanControl.Core.Curves;
+using HwFanControl.Hardware.Cpu;
+using Forms = System.Windows.Forms;
+
+namespace HwFanControl.App;
+
+public partial class MainWindow : Window, INotifyPropertyChanged
+{
+    private readonly FanControlService _service;
+    private readonly WarningMonitor _warnings;
+    private readonly DispatcherTimer _uiTimer;
+    private readonly TempGraphModel _graph = new();
+
+    private readonly TempGraphModel _graphSpeed = new()
+    {
+        Series0Name = "Core Clock Avg",
+        Series2Name = "Core Clock Max",
+        MaxCaption = "Maximum CPU Clock",
+        Unit = " MHz",
+        UnitLabel = "MHz",
+        ValueDecimals = 0,
+        AxisStep = 500f,
+        AxisPad = 250f,
+        AxisMinRange = 1000f,
+        DefaultAxisMin = 3000f,
+        DefaultAxisMax = 5000f,
+    };
+
+    private readonly TempGraphModel _graphMul = new()
+    {
+        Series0Name = "Multiplier Avg",
+        Series2Name = "Multiplier Max",
+        MaxCaption = "Maximum CPU Multiplier",
+        Unit = "x",
+        UnitLabel = "x",
+        ValueDecimals = 1,
+        AxisStep = 5f,
+        AxisPad = 2f,
+        AxisMinRange = 10f,
+        DefaultAxisMin = 30f,
+        DefaultAxisMax = 50f,
+    };
+
+    private readonly TempGraphModel _graphPower = new()
+    {
+        Series0Name = "CPU Package",
+        Series2Name = "Core (max)",
+        MaxCaption = "Maximum CPU Power",
+        Unit = " W",
+        UnitLabel = "W",
+        ValueDecimals = 1,
+        AxisStep = 10f,
+        AxisPad = 5f,
+        AxisMinRange = 20f,
+        DefaultAxisMin = 0f,
+        DefaultAxisMax = 60f,
+    };
+
+    private TempGraphModel _activeCpuGraph = null!;
+    private Forms.NotifyIcon? _tray;
+    private CompactWindow? _compact;
+    private bool _gpuFanUiInit;
+    private System.Drawing.Icon? _trayTempIcon;
+    private int _lastTrayTemp = int.MinValue;
+    private bool _reallyExit;
+
+    public event PropertyChangedEventHandler? PropertyChanged;
+    public TempGraphModel Graph => _graph;
+
+    public FanChannelMode[] ModeOptions { get; } =
+    [
+        FanChannelMode.Disabled,
+        FanChannelMode.Manual,
+        FanChannelMode.Software,
+    ];
+
+    public TemperatureSourceKind[] SourceOptions { get; } =
+    [
+        TemperatureSourceKind.CpuPackage,
+        TemperatureSourceKind.CpuCoreMax,
+        TemperatureSourceKind.GpuEdge,
+        TemperatureSourceKind.GpuJunction,
+        TemperatureSourceKind.GpuHotspot,
+        TemperatureSourceKind.Ambient,
+        TemperatureSourceKind.AvgCpuGpu,
+        TemperatureSourceKind.MaxCpuGpu,
+        TemperatureSourceKind.AvgCpuGpuFiltered,
+        TemperatureSourceKind.MaxCpuGpuFiltered,
+        TemperatureSourceKind.MultipleControllers,
+    ];
+
+    public CpuInfoViewModel CpuInfo => _service.CpuInfo;
+    public OverviewViewModel OverviewVm => _service.Overview;
+    public GpuViewModel GpuVm => _service.Gpu;
+    public HdTempViewModel HdTempVm => _service.HdTemp;
+    public SmartViewModel SmartVm => _service.Smart;
+    public MainboardViewModel MainboardVm => _service.Mainboard;
+    public SystemViewModel SystemVm => _service.SystemVm;
+
+    public MainWindow()
+    {
+        InitializeComponent();
+        DataContext = this;
+        _service = App.Service;
+        _warnings = new WarningMonitor(Dispatcher);
+
+        TempList.ItemsSource = _service.Temperatures;
+        FanList.ItemsSource = _service.Fans;
+        CpuTempLegend.ItemsSource = _graph.Legend;
+        TempGraph.Bind(_graph);
+        _activeCpuGraph = _graph;
+        GpuFanMode.SelectionChanged += GpuFanMode_Changed;
+        OverviewLegend.ItemsSource = _service.Overview.Legend;
+        OverviewGraph.Bind(_service.Overview);
+        GpuLegend.ItemsSource = _service.Gpu.Legend;
+        GpuGraph.Bind(_service.Gpu);
+        HdTempLegend.ItemsSource = _service.HdTemp.Legend;
+        HdTempGraph.Bind(_service.HdTemp);
+        MainboardLegend.ItemsSource = _service.Mainboard.Legend;
+        MainboardFanList.ItemsSource = _service.Mainboard.Fans;
+        MainboardGraph.Bind(_service.Mainboard);
+        SystemGraph.Bind(_service.SystemVm);
+
+        ApplyStartupGlobal.IsChecked = _service.Profile.ApplyOnStartupGlobal;
+        MenuApplyStartup.IsChecked = _service.Profile.ApplyOnStartupGlobal;
+        MenuLogging.IsChecked = _service.Profile.Logging.Enabled;
+        GpuApplyStartup.IsChecked = _service.Profile.ApplyOnStartupGlobal;
+
+        UpdateBanner();
+        ApplyLocalization();
+        LocalizationService.Instance.LanguageChanged += () => Dispatcher.BeginInvoke(ApplyLocalization);
+        InitTray();
+        RefreshAllUi();
+        OnPropertyChanged(nameof(CpuInfo));
+
+        _uiTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(1000) };
+        _uiTimer.Tick += (_, _) => RefreshAllUi();
+        _uiTimer.Start();
+
+        _service.UiTick += () => Dispatcher.BeginInvoke(RefreshAllUi);
+    }
+
+    private void RefreshAllUi()
+    {
+        try
+        {
+            _service.ApplyCpuToUi();
+            _service.ApplyOverviewToUi();
+            _service.ApplyGpuToUi();
+            if (!_gpuFanUiInit && _service.IsHardwareOpen)
+            {
+                _gpuFanUiInit = true;
+                GpuFanMode.SelectedIndex = _service.Profile.GpuFan.SoftwareControl ? 1 : 0;
+            }
+            _service.ApplyGpuFanControl();
+            _service.ApplyHdTempToUi();
+            _service.ApplySmartToUi();
+            _service.ApplyMainboardToUi();
+            _service.ApplySystemToUi();
+            UpdateGraphFromCpu();
+            OverviewGraph.Redraw();
+            GpuGraph.Redraw();
+            HdTempGraph.Redraw();
+            MainboardGraph.Redraw();
+            SystemGraph.Redraw();
+            RefreshStatus();
+            _warnings.Tick(ResolveCpuWarningTemp());
+            _warnings.TickGpu(ResolveGpuWarningTemp());
+            _warnings.TickDrives(ResolveDriveWarningTemp());
+            _warnings.TickFans(CollectFanStates());
+            UpdateTrayTemp();
+            _compact?.RefreshData();
+        }
+        catch (Exception ex)
+        {
+            StatusText.Text = "Error: " + ex.Message;
+            StatusText.Foreground = System.Windows.Media.Brushes.OrangeRed;
+        }
+    }
+
+    private void ApplyLocalization()
+    {
+        var loc = LocalizationService.Instance;
+        Title = $"{AppVersion.ProductName} {AppVersion.Display}";
+        MenuFile.Header = loc.T("Menu.File");
+        MenuSaveProfile.Header = loc.T("Menu.SaveProfile");
+        MenuExit.Header = loc.T("Menu.Exit");
+        MenuOptions.Header = loc.T("Menu.Options");
+        MenuApplyStartup.Header = loc.T("Menu.ApplyStartup");
+        MenuSettings.Header = loc.T("Menu.Settings");
+        MenuLanguage.Header = loc.T("Menu.Language");
+        MenuLangEn.Header = loc.T("Lang.English");
+        MenuLangId.Header = loc.T("Lang.Indonesian");
+        MenuLangEn.IsChecked = loc.IsEnglish;
+        MenuLangId.IsChecked = loc.IsIndonesian;
+        MenuTools.Header = loc.T("Menu.Tools");
+        MenuPawnIo.Header = loc.T("Menu.PawnIO");
+        MenuRestoreBios.Header = loc.T("Menu.RestoreBios");
+        MenuHelp.Header = loc.T("Menu.Help");
+        MenuAbout.Header = loc.T("Menu.About");
+        FanTempsGroup.Header = loc.T("Fan.Temps");
+        ApplyStartupGlobal.Content = loc.T("Fan.ApplyStartup");
+        UpdateBanner();
+        RefreshStatus();
+        if (_tray is not null)
+        {
+            _tray.Text = AppVersion.ProductName;
+            RebuildTrayMenu();
+        }
+    }
+
+    private void MenuLangEn_Click(object sender, RoutedEventArgs e)
+    {
+        LocalizationService.Instance.Language = AppLanguage.English;
+    }
+
+    private void MenuLangId_Click(object sender, RoutedEventArgs e)
+    {
+        LocalizationService.Instance.Language = AppLanguage.Indonesian;
+    }
+
+    /// <summary>Package / socket / max core — whichever is hotter.</summary>
+    /// <summary>Hottest GPU reading (edge / junction / hotspot).</summary>
+    private float ResolveGpuWarningTemp()
+    {
+        float max = float.NaN;
+        foreach (var row in _service.Temperatures)
+        {
+            if (row.Source is not (TemperatureSourceKind.GpuEdge or TemperatureSourceKind.GpuJunction or TemperatureSourceKind.GpuHotspot))
+                continue;
+            if (!row.HasValue || float.IsNaN(row.ValueCelsius))
+                continue;
+            max = float.IsNaN(max) ? row.ValueCelsius : Math.Max(max, row.ValueCelsius);
+        }
+
+        return max;
+    }
+
+    /// <summary>Hottest drive temperature from the Overview storage list.</summary>
+    private float ResolveDriveWarningTemp()
+    {
+        float max = float.NaN;
+        foreach (var row in _service.Overview.DiskRows)
+        {
+            float t = ParseTemp(row.Value);
+            if (float.IsNaN(t))
+                continue;
+            max = float.IsNaN(max) ? t : Math.Max(max, t);
+        }
+
+        return max;
+    }
+
+    private List<(string Name, float PwmPercent, float Rpm, bool HasRpm)> CollectFanStates()
+    {
+        var list = new List<(string Name, float PwmPercent, float Rpm, bool HasRpm)>();
+        foreach (var fan in _service.Fans)
+            list.Add((fan.Name, fan.OutputPwm, fan.Rpm, fan.HasRpm));
+        return list;
+    }
+
+    private float ResolveCpuWarningTemp()
+    {
+        float max = float.NaN;
+        foreach (var row in _service.Temperatures)
+        {
+            if (row.Source is not (TemperatureSourceKind.CpuPackage or TemperatureSourceKind.CpuCoreMax))
+                continue;
+            if (!row.HasValue || float.IsNaN(row.ValueCelsius))
+                continue;
+            max = float.IsNaN(max) ? row.ValueCelsius : Math.Max(max, row.ValueCelsius);
+        }
+
+        if (!float.IsNaN(max))
+            return max;
+
+        // Fallback from live CPU readings if temp rows are empty.
+        float socket = float.NaN;
+        float coreMax = float.NaN;
+        foreach (var row in _service.CpuInfo.Readings)
+        {
+            float t = ParseTemp(row.CurrentText);
+            if (float.IsNaN(t))
+                continue;
+            if (row.Label.StartsWith("Core #", StringComparison.OrdinalIgnoreCase))
+                coreMax = float.IsNaN(coreMax) ? t : Math.Max(coreMax, t);
+            else if (row.Label.Equals("Tdie", StringComparison.OrdinalIgnoreCase) ||
+                     row.Label.Contains("Tctl", StringComparison.OrdinalIgnoreCase) ||
+                     row.Label.Contains("Package", StringComparison.OrdinalIgnoreCase) ||
+                     row.Label.Contains("Socket", StringComparison.OrdinalIgnoreCase))
+                socket = t;
+        }
+
+        if (float.IsNaN(socket))
+            return coreMax;
+        if (float.IsNaN(coreMax))
+            return socket;
+        return Math.Max(socket, coreMax);
+    }
+
+    private void UpdateGraphFromCpu()
+    {
+        var info = _service.CpuInfo;
+        _graph.UpdateIdentity(info.Model, info.IsAmd, info.IsIntel);
+        _graphSpeed.UpdateIdentity(info.Model, info.IsAmd, info.IsIntel);
+        _graphMul.UpdateIdentity(info.Model, info.IsAmd, info.IsIntel);
+        _graphPower.UpdateIdentity(info.Model, info.IsAmd, info.IsIntel);
+        GraphVendor.Text = _activeCpuGraph.VendorText;
+        GraphModel.Text = _activeCpuGraph.ModelText;
+
+        float socket = float.NaN;
+        float ccd = float.NaN;
+        float coreSum = 0;
+        int coreCount = 0;
+        foreach (var row in info.Readings)
+        {
+            if (row.Label.Equals("Tdie", StringComparison.OrdinalIgnoreCase) ||
+                row.Label.Contains("Tctl", StringComparison.OrdinalIgnoreCase) ||
+                row.Label.Contains("Package", StringComparison.OrdinalIgnoreCase) ||
+                row.Label.Contains("Socket", StringComparison.OrdinalIgnoreCase))
+            {
+                socket = ParseTemp(row.CurrentText);
+            }
+            else if (row.Label.Contains("CCD", StringComparison.OrdinalIgnoreCase))
+            {
+                if (float.IsNaN(ccd))
+                    ccd = ParseTemp(row.CurrentText);
+            }
+            else if (row.Label.StartsWith("Core #", StringComparison.OrdinalIgnoreCase))
+            {
+                float t = ParseTemp(row.CurrentText);
+                if (!float.IsNaN(t) && t > 0.01f)
+                {
+                    coreSum += t;
+                    coreCount++;
+                }
+            }
+        }
+
+        // When per-core temps are missing, fall back to socket/Tdie as "CPU Cores".
+        float cores = coreCount > 0 ? coreSum / coreCount : socket;
+        _graph.Push(cores, ccd, socket);
+
+        // Speed / Multiplier / Power aggregates from the same readings (unit-suffix matched).
+        float clkSum = 0, clkMax = float.NaN; int clkN = 0;
+        float mulSum = 0, mulMax = float.NaN; int mulN = 0;
+        float pkgPow = float.NaN, corePowMax = float.NaN;
+        foreach (var row in info.Readings)
+        {
+            string txt = row.CurrentText;
+            float v = ParseValue(txt);
+            if (float.IsNaN(v))
+                continue;
+            bool isCore = row.Label.StartsWith("Core #", StringComparison.OrdinalIgnoreCase);
+            if (isCore && txt.Contains("MHz", StringComparison.OrdinalIgnoreCase))
+            {
+                clkSum += v; clkN++;
+                clkMax = float.IsNaN(clkMax) ? v : Math.Max(clkMax, v);
+            }
+            else if (txt.EndsWith("W", StringComparison.OrdinalIgnoreCase))
+            {
+                if (row.Label.Equals("Package", StringComparison.OrdinalIgnoreCase))
+                    pkgPow = v;
+                else if (isCore)
+                    corePowMax = float.IsNaN(corePowMax) ? v : Math.Max(corePowMax, v);
+            }
+            else if (isCore
+                     && !txt.Contains("°C", StringComparison.OrdinalIgnoreCase)
+                     && !txt.Contains("%", StringComparison.OrdinalIgnoreCase)
+                     && !txt.EndsWith("V", StringComparison.OrdinalIgnoreCase)
+                     && v >= 4f && v <= 100f)
+            {
+                mulSum += v; mulN++;
+                mulMax = float.IsNaN(mulMax) ? v : Math.Max(mulMax, v);
+            }
+        }
+        _graphSpeed.Push(clkN > 0 ? clkSum / clkN : float.NaN, float.NaN, clkMax);
+        _graphMul.Push(mulN > 0 ? mulSum / mulN : float.NaN, float.NaN, mulMax);
+        _graphPower.Push(pkgPow, float.NaN, corePowMax);
+        TempGraph.Redraw();
+    }
+
+    private void GpuFanMode_Changed(object sender, SelectionChangedEventArgs e)
+    {
+        if (!_service.IsHardwareOpen)
+            return;
+        _service.SetGpuFanSoftwareControl(GpuFanMode.SelectedIndex == 1);
+    }
+
+    private void GpuCurve_Click(object sender, RoutedEventArgs e)
+    {
+        var dlg = new CurveEditorWindow(_service.Profile.GpuFan.Curve) { Owner = this };
+        if (dlg.ShowDialog() == true)
+        {
+            _service.Profile.GpuFan.Curve = dlg.ResultCurve;
+            _service.SaveProfile();
+        }
+    }
+
+    private void MenuLogging_Click(object sender, RoutedEventArgs e)
+    {
+        _service.Profile.Logging.Enabled = MenuLogging.IsChecked;
+        _service.SaveProfile();
+    }
+
+    private void OverviewLegend_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is CheckBox { DataContext: OverviewLegendUi item })
+            _service.SetOverviewSeriesVisible(item.Name, item.IsVisible);
+    }
+
+    private void CpuSubTab_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not System.Windows.Controls.Primitives.ToggleButton clicked)
+            return;
+
+        CpuSubTemp.IsChecked = ReferenceEquals(clicked, CpuSubTemp);
+        CpuSubSpeed.IsChecked = ReferenceEquals(clicked, CpuSubSpeed);
+        CpuSubMul.IsChecked = ReferenceEquals(clicked, CpuSubMul);
+        CpuSubPower.IsChecked = ReferenceEquals(clicked, CpuSubPower);
+
+        CpuTempView.Visibility = Visibility.Visible;
+        CpuPlaceholderView.Visibility = Visibility.Collapsed;
+
+        _activeCpuGraph = clicked switch
+        {
+            _ when ReferenceEquals(clicked, CpuSubSpeed) => _graphSpeed,
+            _ when ReferenceEquals(clicked, CpuSubMul) => _graphMul,
+            _ when ReferenceEquals(clicked, CpuSubPower) => _graphPower,
+            _ => _graph,
+        };
+        TempGraph.Bind(_activeCpuGraph);
+        CpuTempLegend.ItemsSource = _activeCpuGraph.Legend;
+        GraphVendor.Text = _activeCpuGraph.VendorText;
+        GraphModel.Text = _activeCpuGraph.ModelText;
+    }
+
+    private void MainboardSubTab_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not ToggleButton clicked)
+            return;
+
+        MbSubTemp.IsChecked = ReferenceEquals(clicked, MbSubTemp);
+        MbSubFanSpeed.IsChecked = ReferenceEquals(clicked, MbSubFanSpeed);
+        MbSubFanControl.IsChecked = ReferenceEquals(clicked, MbSubFanControl);
+
+        MbTempView.Visibility = MbSubTemp.IsChecked == true ? Visibility.Visible : Visibility.Collapsed;
+        MbFanSpeedView.Visibility = MbSubFanSpeed.IsChecked == true ? Visibility.Visible : Visibility.Collapsed;
+        MbFanControlView.Visibility = MbSubFanControl.IsChecked == true ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    private void SystemSubTab_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not ToggleButton clicked)
+            return;
+
+        SysSubCpu.IsChecked = ReferenceEquals(clicked, SysSubCpu);
+        SysSubRam.IsChecked = ReferenceEquals(clicked, SysSubRam);
+        SysSubNet.IsChecked = ReferenceEquals(clicked, SysSubNet);
+        SysSubDisk.IsChecked = ReferenceEquals(clicked, SysSubDisk);
+        SysSubSynth.IsChecked = ReferenceEquals(clicked, SysSubSynth);
+
+        var view = clicked switch
+        {
+            _ when ReferenceEquals(clicked, SysSubRam) => SystemSubView.Ram,
+            _ when ReferenceEquals(clicked, SysSubNet) => SystemSubView.Network,
+            _ when ReferenceEquals(clicked, SysSubDisk) => SystemSubView.DiskIo,
+            _ when ReferenceEquals(clicked, SysSubSynth) => SystemSubView.SynthTemp,
+            _ => SystemSubView.CpuUsage,
+        };
+        _service.SystemVm.SelectView(view);
+        SystemGraph.Redraw();
+    }
+
+    private static float ParseValue(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return float.NaN;
+        var sb = new System.Text.StringBuilder();
+        foreach (char ch in text)
+        {
+            if (char.IsDigit(ch) || ch == '.' || ch == ',')
+                sb.Append(ch);
+            else if (sb.Length > 0)
+                break;
+        }
+        string s = sb.ToString();
+        if (s.Contains(',') && s.Contains('.'))
+            s = s.Replace(",", "");
+        else
+            s = s.Replace(',', '.');
+        return float.TryParse(s, System.Globalization.NumberStyles.Float,
+            System.Globalization.CultureInfo.InvariantCulture, out float v)
+            ? v
+            : float.NaN;
+    }
+
+    private static float ParseTemp(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text) || text == "—")
+            return float.NaN;
+        string num = text.Replace("°C", "", StringComparison.OrdinalIgnoreCase).Trim();
+        return float.TryParse(num, System.Globalization.NumberStyles.Float,
+            System.Globalization.CultureInfo.InvariantCulture, out float v)
+            ? v
+            : float.NaN;
+    }
+
+    private void UpdateBanner()
+    {
+        if (_service.IsElevated && string.IsNullOrEmpty(_service.LastError))
+        {
+            ElevationBanner.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        ElevationBanner.Visibility = Visibility.Visible;
+        var loc = LocalizationService.Instance;
+        if (!string.IsNullOrEmpty(_service.LastError))
+            ElevationText.Text = loc.T("Banner.HwError") + _service.LastError;
+        else
+            ElevationText.Text = loc.T("Banner.NotElevated");
+    }
+
+    private void RefreshStatus()
+    {
+        var loc = LocalizationService.Instance;
+        float cpuLoad = AverageCoreLoad();
+        StatusCpu.Text = float.IsNaN(cpuLoad)
+            ? $"{loc.T("Status.Cpu")} —"
+            : $"{loc.T("Status.Cpu")} {cpuLoad:0.0} %";
+        StatusRam.Text = FormatRam();
+
+        if (_service.IsHardwareOpen &&
+            _service.CpuInfo.Status.Contains("PawnIO", StringComparison.OrdinalIgnoreCase))
+        {
+            StatusText.Text = _service.CpuInfo.Status;
+            StatusText.Foreground = System.Windows.Media.Brushes.White;
+        }
+        else if (_service.IsHardwareOpen && _service.Smart.Drives.Count > 0)
+        {
+            StatusText.Text = _service.Smart.OverallStatusText;
+            StatusText.Foreground = _service.Smart.OverallStatusBrush;
+        }
+        else
+        {
+            StatusText.Text = _service.IsHardwareOpen
+                ? $"Hardware OK · PWM={_service.FanControlCount}"
+                : "Hardware OFF";
+            StatusText.Foreground = System.Windows.Media.Brushes.White;
+        }
+
+        StatusTime.Text = $"{AppVersion.Display}  ·  {DateTime.Now:h:mm:ss tt}";
+    }
+
+    private float AverageCoreLoad()
+    {
+        float sum = 0;
+        int n = 0;
+        foreach (var row in _service.CpuInfo.Readings)
+        {
+            if (!row.Label.StartsWith("Core #", StringComparison.OrdinalIgnoreCase))
+                continue;
+            if (row.LoadText is null || row.LoadText == "—")
+                continue;
+            string s = row.LoadText.Replace("%", "").Trim();
+            if (float.TryParse(s, System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture, out float v))
+            {
+                sum += v;
+                n++;
+            }
+        }
+
+        return n == 0 ? float.NaN : sum / n;
+    }
+
+    private string FormatRam()
+    {
+        var loc = LocalizationService.Instance;
+        try
+        {
+            using var searcher = new System.Management.ManagementObjectSearcher(
+                "SELECT TotalVisibleMemorySize, FreePhysicalMemory FROM Win32_OperatingSystem");
+            foreach (System.Management.ManagementObject obj in searcher.Get())
+            {
+                double totalKb = Convert.ToDouble(obj["TotalVisibleMemorySize"]);
+                double freeKb = Convert.ToDouble(obj["FreePhysicalMemory"]);
+                double usedGb = (totalKb - freeKb) / (1024.0 * 1024.0);
+                double pct = (totalKb - freeKb) / totalKb * 100.0;
+                return $"{loc.T("Status.Ram")} {usedGb:0.00} GB / {pct:0} %";
+            }
+        }
+        catch
+        {
+            // ignore
+        }
+
+        return $"{loc.T("Status.Ram")} —";
+    }
+
+    private void UpdateTrayTemp()
+    {
+        if (_tray is null)
+            return;
+        float t = ResolveCpuWarningTemp();
+        if (float.IsNaN(t))
+            return;
+        int ti = (int)Math.Round(t);
+        string? dist = CurrentDistanceText();
+        _tray.Text = dist is null
+            ? $"{AppVersion.ProductName} - CPU {ti}°C"
+            : $"{AppVersion.ProductName} - CPU {ti}°C (Δ TjMax {dist})";
+        // NOTE: degree/delta written as C# unicode escapes in source below at build time.
+        if (ti == _lastTrayTemp)
+            return;
+        _lastTrayTemp = ti;
+        var old = _trayTempIcon;
+        _trayTempIcon = TrayTempIcon.Create(ti);
+        _tray.Icon = _trayTempIcon;
+        old?.Dispose();
+    }
+
+    private void ToggleCompact()
+    {
+        if (_compact is not null)
+        {
+            _compact.Close();
+            _compact = null;
+            return;
+        }
+        _compact = new CompactWindow(this);
+        _compact.Closed += (_, _) => _compact = null;
+        _compact.Show();
+    }
+
+    internal float CurrentCpuTemp() => ResolveCpuWarningTemp();
+
+    internal string? CurrentDistanceText()
+    {
+        foreach (var row in _service.CpuInfo.Readings)
+        {
+            if (row.Label.StartsWith("Jarak", StringComparison.OrdinalIgnoreCase))
+                return row.CurrentText;
+        }
+        return null;
+    }
+
+    internal void RestoreFromCompact() => RestoreFromTray();
+
+    private void InitTray()
+    {
+        _tray = new Forms.NotifyIcon
+        {
+            Text = AppVersion.ProductName,
+            Visible = true,
+            Icon = System.Drawing.SystemIcons.Application,
+        };
+        _tray.DoubleClick += (_, _) => RestoreFromTray();
+        RebuildTrayMenu();
+    }
+
+    private void RebuildTrayMenu()
+    {
+        if (_tray is null)
+            return;
+        var loc = LocalizationService.Instance;
+        var menu = new Forms.ContextMenuStrip();
+        menu.Items.Add(loc.T("Tray.Open"), null, (_, _) => RestoreFromTray());
+        menu.Items.Add("Mode Ringkas", null, (_, _) => ToggleCompact());
+        menu.Items.Add(loc.T("Tray.Exit"), null, (_, _) =>
+        {
+            _reallyExit = true;
+            Close();
+        });
+        _tray.ContextMenuStrip = menu;
+    }
+
+    private void RestoreFromTray()
+    {
+        Show();
+        if (WindowState == WindowState.Minimized)
+            WindowState = WindowState.Normal;
+        Activate();
+    }
+
+    private void Window_StateChanged(object sender, EventArgs e)
+    {
+        if (WindowState == WindowState.Minimized)
+        {
+            Hide();
+            var loc = LocalizationService.Instance;
+            _tray?.ShowBalloonTip(800, AppVersion.ProductName, loc.T("Tray.Tip"), Forms.ToolTipIcon.Info);
+            return;
+        }
+
+        // Maximized / restored: Viewbox scales content automatically.
+    }
+
+    private void Window_SizeChanged(object sender, SizeChangedEventArgs e)
+    {
+        // Viewbox handles uniform font/layout scaling to the 900×740 design canvas.
+    }
+
+    private void Window_Closing(object sender, CancelEventArgs e)
+    {
+        if (!_reallyExit)
+        {
+            e.Cancel = true;
+            WindowState = WindowState.Minimized;
+            return;
+        }
+
+        _uiTimer.Stop();
+        _warnings.Dispose();
+        if (_tray is not null)
+        {
+            _tray.Visible = false;
+            _tray.Dispose();
+            _tray = null;
+        }
+    }
+
+    private void MenuSettings_Click(object sender, RoutedEventArgs e)
+    {
+        var dlg = new SettingsWindow(_warnings.Settings) { Owner = this };
+        if (dlg.ShowDialog() == true && dlg.Result is not null)
+            _warnings.ReplaceSettings(dlg.Result);
+    }
+
+    private void MenuSave_Click(object sender, RoutedEventArgs e) => _service.SaveProfile();
+
+    private void MenuExit_Click(object sender, RoutedEventArgs e)
+    {
+        _reallyExit = true;
+        Close();
+    }
+
+    private void MenuApplyStartup_Click(object sender, RoutedEventArgs e)
+    {
+        bool on = MenuApplyStartup.IsChecked;
+        _service.Profile.ApplyOnStartupGlobal = on;
+        ApplyStartupGlobal.IsChecked = on;
+        GpuApplyStartup.IsChecked = on;
+        _service.SaveProfile();
+    }
+
+    private void MenuPawnIo_Click(object sender, RoutedEventArgs e)
+    {
+        bool installed = PawnIoStatus.IsInstalled();
+        var result = System.Windows.MessageBox.Show(
+            installed
+                ? "PawnIO sudah terdeteksi di sistem.\n\nJika suhu masih 0°C, restart PC atau reinstall PawnIO (versi standard).\n\nBuka halaman unduhan?"
+                : "LibreHardwareMonitor 0.9.5+ membutuhkan driver PawnIO untuk membaca suhu AMD / SuperIO.\n" +
+                  "Admin saja TIDAK cukup (WinRing0 sudah diganti).\n\nBuka halaman unduhan PawnIO?",
+            "PawnIO",
+            MessageBoxButton.YesNo,
+            MessageBoxImage.Information);
+
+        if (result == MessageBoxResult.Yes)
+            PawnIoStatus.OpenDownloadPage();
+    }
+
+    private void MenuRestoreBios_Click(object sender, RoutedEventArgs e)
+    {
+        _service.EmergencyRestore();
+        var loc = LocalizationService.Instance;
+        System.Windows.MessageBox.Show(
+            loc.T("Msg.BiosRestored"),
+            AppVersion.ProductName,
+            MessageBoxButton.OK,
+            MessageBoxImage.Information);
+    }
+
+    private void MenuAbout_Click(object sender, RoutedEventArgs e)
+    {
+        var loc = LocalizationService.Instance;
+        string body = string.Format(
+            loc.T("About.Body"),
+            AppVersion.ProductName,
+            AppVersion.Display);
+        System.Windows.MessageBox.Show(
+            body,
+            loc.T("About.Title"),
+            MessageBoxButton.OK,
+            MessageBoxImage.Information);
+    }
+
+    private void ApplyStartupGlobal_Changed(object sender, RoutedEventArgs e)
+    {
+        bool on = ApplyStartupGlobal.IsChecked == true;
+        _service.Profile.ApplyOnStartupGlobal = on;
+        MenuApplyStartup.IsChecked = on;
+        GpuApplyStartup.IsChecked = on;
+        _service.SaveProfile();
+    }
+
+    private void GpuApplyStartup_Changed(object sender, RoutedEventArgs e)
+    {
+        bool on = GpuApplyStartup.IsChecked == true;
+        _service.Profile.ApplyOnStartupGlobal = on;
+        ApplyStartupGlobal.IsChecked = on;
+        MenuApplyStartup.IsChecked = on;
+        _service.SaveProfile();
+    }
+
+    private FanChannelConfig? ConfigFromTag(object sender)
+    {
+        if (sender is FrameworkElement { Tag: FanRow row })
+            return _service.Logic.GetChannel(row.ChannelIndex);
+        return null;
+    }
+
+    private void FanMode_Changed(object sender, SelectionChangedEventArgs e)
+    {
+        if (sender is not ComboBox { DataContext: FanRow row })
+            return;
+        var cfg = _service.Logic.GetChannel(row.ChannelIndex);
+        cfg.Mode = row.Mode;
+        _service.ApplyChannel(cfg);
+    }
+
+    private void FanSource_Changed(object sender, SelectionChangedEventArgs e)
+    {
+        if (sender is not ComboBox { DataContext: FanRow row })
+            return;
+        var cfg = _service.Logic.GetChannel(row.ChannelIndex);
+        cfg.TemperatureSource = row.Source;
+        _service.ApplyChannel(cfg);
+    }
+
+    private void FanApplyStartup_Changed(object sender, RoutedEventArgs e)
+    {
+        if (sender is not CheckBox { DataContext: FanRow row })
+            return;
+        var cfg = _service.Logic.GetChannel(row.ChannelIndex);
+        cfg.ApplyOnStartup = row.ApplyOnStartup;
+        cfg.Name = row.Name;
+        _service.ApplyChannel(cfg);
+    }
+
+    private void ManualApply_Click(object sender, RoutedEventArgs e)
+    {
+        if (ConfigFromTag(sender) is not { } cfg)
+            return;
+        if (sender is FrameworkElement { Tag: FanRow row })
+        {
+            cfg.Name = row.Name;
+            cfg.ManualPwmPercent = (float)row.ManualPwm;
+            cfg.Mode = FanChannelMode.Manual;
+            row.Mode = FanChannelMode.Manual;
+        }
+
+        _service.ApplyChannel(cfg);
+    }
+
+    private void Curve_Click(object sender, RoutedEventArgs e)
+    {
+        if (ConfigFromTag(sender) is not { } cfg)
+            return;
+
+        var slot = cfg.Controllers[0];
+        var dlg = new CurveEditorWindow(slot.Curve) { Owner = this };
+        if (dlg.ShowDialog() == true)
+        {
+            slot.Curve = dlg.ResultCurve;
+            cfg.Mode = FanChannelMode.Software;
+            _service.ApplyChannel(cfg);
+        }
+    }
+
+    private void Multi_Click(object sender, RoutedEventArgs e)
+    {
+        if (ConfigFromTag(sender) is not { } cfg)
+            return;
+
+        var dlg = new MultiControllerWindow(cfg) { Owner = this };
+        if (dlg.ShowDialog() == true)
+        {
+            cfg.TemperatureSource = TemperatureSourceKind.MultipleControllers;
+            cfg.Mode = FanChannelMode.Software;
+            _service.ApplyChannel(cfg);
+            if (sender is FrameworkElement { Tag: FanRow row })
+            {
+                row.Source = TemperatureSourceKind.MultipleControllers;
+                row.Mode = FanChannelMode.Software;
+            }
+        }
+    }
+
+    private void Advanced_Click(object sender, RoutedEventArgs e)
+    {
+        if (ConfigFromTag(sender) is not { } cfg)
+            return;
+
+        var dlg = new AdvancedOptionsWindow(cfg) { Owner = this };
+        if (dlg.ShowDialog() == true)
+            _service.ApplyChannel(cfg);
+    }
+
+    private void OnPropertyChanged([CallerMemberName] string? name = null) =>
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+}

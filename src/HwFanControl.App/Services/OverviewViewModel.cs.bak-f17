@@ -1,0 +1,370 @@
+﻿using System.Collections.ObjectModel;
+using System.Windows.Media;
+using HwFanControl.Hardware.Overview;
+
+namespace HwFanControl.App.Services;
+
+public sealed class OverviewViewModel : ObservableObject
+{
+    public const int HistoryCapacity = 180;
+
+    private static readonly Color[] Palette =
+    [
+        Color.FromRgb(0x1A, 0x3A, 0x6E), // CPU cores dark blue
+        Color.FromRgb(0xC0, 0x39, 0x2B), // GPU red
+        Color.FromRgb(0xE6, 0x7E, 0x22),
+        Color.FromRgb(0x8E, 0x44, 0xAD),
+        Color.FromRgb(0x27, 0xAE, 0x60),
+        Color.FromRgb(0x29, 0x80, 0xB9),
+        Color.FromRgb(0x16, 0xA0, 0x85),
+        Color.FromRgb(0xD3, 0x54, 0x00),
+        Color.FromRgb(0x2C, 0x3E, 0x50),
+        Color.FromRgb(0xF3, 0x9C, 0x12),
+    ];
+
+    private readonly Dictionary<string, Queue<float>> _histories = new(StringComparer.Ordinal);
+    private float _axisMin = 30;
+    private float _axisMax = 65;
+
+    public ObservableCollection<OverviewPairUi> Pairs { get; } = new();
+    public ObservableCollection<OverviewCoreUi> Cores { get; } = new();
+
+    private string _cpuTitle = "";
+    public string CpuTitle { get => _cpuTitle; private set => Set(ref _cpuTitle, value); }
+
+    private string _tjMaxText = "";
+    public string TjMaxText { get => _tjMaxText; private set => Set(ref _tjMaxText, value); }
+
+    /// <summary>Core Temp-style per-core rows for the Overview left panel.</summary>
+    public void ApplyCoreTempStyle(string cpuModel, float tjMax, IReadOnlyList<(float Temp, string Load)> cores)
+    {
+        CpuTitle = cpuModel;
+        TjMaxText = float.IsNaN(tjMax) || tjMax <= 0.01f ? "" : $"Tj. Max: {tjMax:0} °C";
+
+        while (Cores.Count > cores.Count)
+            Cores.RemoveAt(Cores.Count - 1);
+        for (int i = 0; i < cores.Count; i++)
+        {
+            string label = $"Core #{i}";
+            string temp = FormatTemp(cores[i].Temp);
+            string load = cores[i].Load;
+            if (i < Cores.Count)
+                Cores[i].Update(label, temp, load);
+            else
+                Cores.Add(new OverviewCoreUi(label, temp, load));
+        }
+    }
+    public ObservableCollection<OverviewReadingUi> Readings { get; } = new();
+    public ObservableCollection<OverviewReadingUi> GpuReadings { get; } = new();
+    public ObservableCollection<OverviewValueUi> DiskRows { get; } = new();
+
+    private string _storageTitle = "Storage (HDD/SSD/NVMe)";
+    public string StorageTitle { get => _storageTitle; set => Set(ref _storageTitle, value); }
+
+    private string _gpuTitle = "GPU";
+    public string GpuTitle { get => _gpuTitle; private set => Set(ref _gpuTitle, value); }
+
+    /// <summary>WMI model name -> "C:, D:" map, filled by the service at startup.</summary>
+    public Dictionary<string, string> DriveLetters { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
+    public static string GroupOf(string seriesName)
+    {
+        if (seriesName.StartsWith("Core #", StringComparison.Ordinal))
+            return "cpu";
+        if (seriesName.StartsWith("GPU", StringComparison.Ordinal))
+            return "gpu";
+        if (seriesName.Equals("CPU Cores", StringComparison.Ordinal))
+            return "none";
+        return "disk";
+    }
+
+    private void SyncValues(ObservableCollection<OverviewValueUi> target, IReadOnlyList<OverviewValueRow> rows)
+    {
+        while (target.Count > rows.Count)
+            target.RemoveAt(target.Count - 1);
+        for (int i = 0; i < rows.Count; i++)
+        {
+            string label = WithLetters(rows[i].Label);
+            string v = FormatTemp(rows[i].ValueCelsius);
+            if (i < target.Count)
+                target[i].Update(label, v);
+            else
+                target.Add(new OverviewValueUi(label, v));
+        }
+    }
+
+    private static void SyncReadings(ObservableCollection<OverviewReadingUi> target, IReadOnlyList<OverviewReadingRow> rows)
+    {
+        while (target.Count > rows.Count)
+            target.RemoveAt(target.Count - 1);
+        for (int i = 0; i < rows.Count; i++)
+        {
+            var r = rows[i];
+            if (i < target.Count)
+                target[i].Update(r.Label, r.CurrentText, r.MinText, r.MaxText, r.AvgText, r.LoadText);
+            else
+                target.Add(new OverviewReadingUi(r.Label, r.CurrentText, r.MinText, r.MaxText, r.AvgText, r.LoadText));
+        }
+    }
+
+    private string WithLetters(string diskName)
+    {
+        if (DriveLetters.Count == 0)
+            return diskName;
+        string key = NormalizeName(diskName);
+        if (key.Length < 8)
+            return diskName;
+        foreach (var kv in DriveLetters)
+        {
+            string mk = NormalizeName(kv.Key);
+            if (mk.Length >= 8 && (key.StartsWith(mk, StringComparison.Ordinal) || mk.StartsWith(key, StringComparison.Ordinal)))
+                return $"{diskName} ({kv.Value})";
+        }
+
+        return diskName;
+    }
+
+    private static string NormalizeName(string s) =>
+        new string(s.Where(char.IsLetterOrDigit).ToArray()).ToUpperInvariant();
+
+    private readonly HashSet<string> _hiddenSeries = new(StringComparer.Ordinal);
+
+    public void SetHiddenSeries(IEnumerable<string> names)
+    {
+        _hiddenSeries.Clear();
+        foreach (var n in names)
+            _hiddenSeries.Add(n);
+        foreach (var item in Legend)
+            item.IsVisible = !_hiddenSeries.Contains(item.Name);
+    }
+
+    public void ApplyReadings(IReadOnlyList<(string Label, string Value, string Min, string Max, string Avg, string Load)> rows)
+    {
+        while (Readings.Count > rows.Count)
+            Readings.RemoveAt(Readings.Count - 1);
+        for (int i = 0; i < rows.Count; i++)
+        {
+            var r = rows[i];
+            if (i < Readings.Count)
+                Readings[i].Update(r.Label, r.Value, r.Min, r.Max, r.Avg, r.Load);
+            else
+                Readings.Add(new OverviewReadingUi(r.Label, r.Value, r.Min, r.Max, r.Avg, r.Load));
+        }
+    }
+
+    public ObservableCollection<OverviewLegendUi> Legend { get; } = new();
+    public float AxisMin => _axisMin;
+    public float AxisMax => _axisMax;
+
+    public IReadOnlyDictionary<string, Queue<float>> Histories => _histories;
+
+    public Color ColorForIndex(int index) => ThemeService.ForGraph(Palette[Math.Abs(index) % Palette.Length]);
+
+    public void Apply(OverviewSnapshot snap)
+    {
+        // Pairs (left column) — CPU core pairs moved to the Core Temp-style list.
+        var pairs = snap.Pairs
+            .Where(p => !p.Label.StartsWith("Core", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        while (Pairs.Count > pairs.Count)
+            Pairs.RemoveAt(Pairs.Count - 1);
+        for (int i = 0; i < pairs.Count; i++)
+        {
+            var p = pairs[i];
+            if (i < Pairs.Count)
+                Pairs[i].Update(p.Label, FormatTemp(p.Left), FormatTemp(p.Right));
+            else
+                Pairs.Add(new OverviewPairUi(p.Label, FormatTemp(p.Left), FormatTemp(p.Right)));
+        }
+
+        GpuTitle = snap.GpuName;
+        SyncReadings(GpuReadings, snap.GpuReadings);
+        SyncValues(DiskRows, snap.DiskRows);
+
+        // Legend + history
+        while (Legend.Count > snap.Series.Count)
+            Legend.RemoveAt(Legend.Count - 1);
+
+        float min = float.MaxValue, max = float.MinValue;
+        for (int i = 0; i < snap.Series.Count; i++)
+        {
+            var s = snap.Series[i];
+            if (!_histories.TryGetValue(s.Name, out var q))
+            {
+                q = new Queue<float>(HistoryCapacity);
+                _histories[s.Name] = q;
+            }
+
+            Enqueue(q, s.ValueCelsius);
+            foreach (float v in q)
+            {
+                if (float.IsNaN(v) || v <= 0.01f) continue;
+                if (v < min) min = v;
+                if (v > max) max = v;
+            }
+
+            var brush = new SolidColorBrush(ColorForIndex(s.ColorIndex));
+            brush.Freeze();
+            if (i < Legend.Count)
+            {
+                Legend[i].Name = s.Name;
+                Legend[i].Brush = brush;
+                Legend[i].IsVisible = !_hiddenSeries.Contains(s.Name);
+            }
+            else
+            {
+                Legend.Add(new OverviewLegendUi { Name = s.Name, Brush = brush, IsVisible = !_hiddenSeries.Contains(s.Name) });
+            }
+        }
+
+        // Drop stale series histories
+        var keep = new HashSet<string>(snap.Series.Select(s => s.Name), StringComparer.Ordinal);
+        foreach (var key in _histories.Keys.ToList())
+        {
+            if (!keep.Contains(key))
+                _histories.Remove(key);
+        }
+
+        if (min == float.MaxValue)
+        {
+            _axisMin = 30;
+            _axisMax = 65;
+        }
+        else
+        {
+            _axisMin = MathF.Floor((min - 5) / 5f) * 5f;
+            _axisMax = MathF.Ceiling((max + 5) / 5f) * 5f;
+            if (_axisMax - _axisMin < 20)
+                _axisMax = _axisMin + 20;
+        }
+    }
+
+    private static void Enqueue(Queue<float> q, float v)
+    {
+        if (q.Count >= HistoryCapacity)
+            q.Dequeue();
+        q.Enqueue(v);
+    }
+
+    private static string FormatTemp(float v) =>
+        float.IsNaN(v) || v <= 0.01f ? "---" : $"{v:0} °C";
+}
+
+public sealed class OverviewPairUi : ObservableObject
+{
+    private string _label;
+    private string _left;
+    private string _right;
+
+    public OverviewPairUi(string label, string left, string right)
+    {
+        _label = label;
+        _left = left;
+        _right = right;
+    }
+
+    public string Label { get => _label; private set => Set(ref _label, value); }
+    public string Left { get => _left; private set => Set(ref _left, value); }
+    public string Right { get => _right; private set => Set(ref _right, value); }
+
+    public void Update(string label, string left, string right)
+    {
+        Label = label;
+        Left = left;
+        Right = right;
+    }
+}
+
+public sealed class OverviewCoreUi : ObservableObject
+{
+    private string _label;
+    private string _temp;
+    private string _load;
+
+    public OverviewCoreUi(string label, string temp, string load)
+    {
+        _label = label;
+        _temp = temp;
+        _load = load;
+    }
+
+    public string Label { get => _label; private set => Set(ref _label, value); }
+    public string Temp { get => _temp; private set => Set(ref _temp, value); }
+    public string Load { get => _load; private set => Set(ref _load, value); }
+
+    public void Update(string label, string temp, string load)
+    {
+        Label = label;
+        Temp = temp;
+        Load = load;
+    }
+}
+
+public sealed class OverviewLegendUi : ObservableObject
+{
+    private string _name = "";
+    private Brush _brush = Brushes.Black;
+    private bool _isVisible = true;
+
+    public string Name { get => _name; set => Set(ref _name, value); }
+    public Brush Brush { get => _brush; set => Set(ref _brush, value); }
+    public bool IsVisible { get => _isVisible; set => Set(ref _isVisible, value); }
+}
+
+public sealed class OverviewReadingUi : ObservableObject
+{
+    private string _label;
+    private string _value;
+    private string _min;
+    private string _max;
+    private string _avg;
+    private string _load;
+
+    public OverviewReadingUi(string label, string value, string min, string max, string avg, string load)
+    {
+        _label = label;
+        _value = value;
+        _min = min;
+        _max = max;
+        _avg = avg;
+        _load = load;
+    }
+
+    public string Label { get => _label; private set => Set(ref _label, value); }
+    public string Value { get => _value; private set => Set(ref _value, value); }
+    public string Min { get => _min; private set => Set(ref _min, value); }
+    public string Max { get => _max; private set => Set(ref _max, value); }
+    public string Avg { get => _avg; private set => Set(ref _avg, value); }
+    public string Load { get => _load; private set => Set(ref _load, value); }
+
+    public void Update(string label, string value, string min, string max, string avg, string load)
+    {
+        Label = label;
+        Value = value;
+        Min = min;
+        Max = max;
+        Avg = avg;
+        Load = load;
+    }
+}
+
+public sealed class OverviewValueUi : ObservableObject
+{
+    private string _label;
+    private string _value;
+
+    public OverviewValueUi(string label, string value)
+    {
+        _label = label;
+        _value = value;
+    }
+
+    public string Label { get => _label; private set => Set(ref _label, value); }
+    public string Value { get => _value; private set => Set(ref _value, value); }
+
+    public void Update(string label, string value)
+    {
+        Label = label;
+        Value = value;
+    }
+}

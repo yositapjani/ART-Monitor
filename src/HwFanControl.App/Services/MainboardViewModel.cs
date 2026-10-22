@@ -1,0 +1,159 @@
+﻿using System.Collections.ObjectModel;
+using System.Windows.Media;
+using HwFanControl.Hardware.Mainboard;
+
+namespace HwFanControl.App.Services;
+
+public sealed class MainboardViewModel : ObservableObject
+{
+    public const int HistoryCapacity = 180;
+
+    private static readonly Color[] Palette =
+    [
+        Color.FromRgb(0x1A, 0x66, 0xCC), // blue
+        Color.FromRgb(0x22, 0xB1, 0x4C), // green
+        Color.FromRgb(0x8E, 0x44, 0xAD), // purple
+        Color.FromRgb(0xE6, 0x7E, 0x22), // orange
+        Color.FromRgb(0x1A, 0x3A, 0x6E), // dark blue
+        Color.FromRgb(0x9B, 0x59, 0xB6), // violet
+        Color.FromRgb(0xC0, 0x39, 0x8B), // magenta
+        Color.FromRgb(0xF1, 0xC4, 0x0F), // gold
+        Color.FromRgb(0x2E, 0xCC, 0x71), // light green
+        Color.FromRgb(0x34, 0x98, 0xDB), // light blue
+        Color.FromRgb(0xE7, 0x4C, 0x3C), // red
+        Color.FromRgb(0x16, 0xA0, 0x85), // teal
+        Color.FromRgb(0xD3, 0x54, 0x00), // pumpkin
+        Color.FromRgb(0x2C, 0x3E, 0x50), // navy
+        Color.FromRgb(0x27, 0xAE, 0x60), // emerald
+        Color.FromRgb(0x8E, 0x44, 0xAD),
+    ];
+
+    private readonly Dictionary<string, Queue<float>> _histories = new(StringComparer.Ordinal);
+    private float _axisMin;
+    private float _axisMax = 70;
+    private string _boardName = "Motherboard";
+    private string _chipLine = "Monitoring Chip: —";
+
+    public ObservableCollection<MainboardLegendUi> Legend { get; } = new();
+    public ObservableCollection<MainboardFanUi> Fans { get; } = new();
+    public float AxisMin => _axisMin;
+    public float AxisMax => _axisMax;
+    public IReadOnlyDictionary<string, Queue<float>> Histories => _histories;
+
+    public string BoardName { get => _boardName; private set => Set(ref _boardName, value); }
+    public string ChipLine { get => _chipLine; private set => Set(ref _chipLine, value); }
+
+    public Color ColorForIndex(int index) => ThemeService.ForGraph(Palette[Math.Abs(index) % Palette.Length]);
+
+    public void Apply(MainboardSnapshot snap)
+    {
+        BoardName = string.IsNullOrWhiteSpace(snap.BoardName) ? "Motherboard" : snap.BoardName;
+        string chip = string.IsNullOrWhiteSpace(snap.ChipName) ? "—" : snap.ChipName;
+        ChipLine = $"Monitoring Chip: {chip}";
+
+        while (Legend.Count > snap.Temperatures.Count)
+            Legend.RemoveAt(Legend.Count - 1);
+
+        float min = float.MaxValue, max = float.MinValue;
+        for (int i = 0; i < snap.Temperatures.Count; i++)
+        {
+            var s = snap.Temperatures[i];
+            if (!_histories.TryGetValue(s.Name, out var q))
+            {
+                q = new Queue<float>(HistoryCapacity);
+                _histories[s.Name] = q;
+            }
+
+            Enqueue(q, s.ValueCelsius);
+            foreach (float v in q)
+            {
+                if (float.IsNaN(v) || v <= 0.01f) continue;
+                if (v < min) min = v;
+                if (v > max) max = v;
+            }
+
+            var brush = new SolidColorBrush(ColorForIndex(s.ColorIndex));
+            brush.Freeze();
+            string text = FormatLegend(s.Name, s.ValueCelsius);
+            if (i < Legend.Count)
+            {
+                Legend[i].Key = s.Name;
+                Legend[i].Text = text;
+                Legend[i].Brush = brush;
+            }
+            else
+            {
+                Legend.Add(new MainboardLegendUi { Key = s.Name, Text = text, Brush = brush });
+            }
+        }
+
+        var keep = new HashSet<string>(snap.Temperatures.Select(t => t.Name), StringComparer.Ordinal);
+        foreach (var key in _histories.Keys.ToList())
+        {
+            if (!keep.Contains(key))
+                _histories.Remove(key);
+        }
+
+        // Fan Speed sub-tab
+        while (Fans.Count > snap.Fans.Count)
+            Fans.RemoveAt(Fans.Count - 1);
+        for (int i = 0; i < snap.Fans.Count; i++)
+        {
+            var f = snap.Fans[i];
+            string rpmText = float.IsNaN(f.Rpm) || f.Rpm < 1f ? "—" : $"{f.Rpm:0} RPM";
+            if (i < Fans.Count)
+            {
+                Fans[i].Name = f.Name;
+                Fans[i].RpmText = rpmText;
+            }
+            else
+            {
+                Fans.Add(new MainboardFanUi { Name = f.Name, RpmText = rpmText });
+            }
+        }
+
+        // Argus Mainboard temp axis: floor at 0, 10°C steps with headroom.
+        if (min == float.MaxValue)
+        {
+            _axisMin = 0;
+            _axisMax = 70;
+        }
+        else
+        {
+            _axisMin = 0;
+            _axisMax = MathF.Ceiling((max + 5) / 10f) * 10f;
+            if (_axisMax < 50) _axisMax = 50;
+            if (_axisMax - _axisMin < 20) _axisMax = _axisMin + 20;
+        }
+    }
+
+    private static void Enqueue(Queue<float> q, float v)
+    {
+        if (q.Count >= HistoryCapacity)
+            q.Dequeue();
+        q.Enqueue(v);
+    }
+
+    private static string FormatLegend(string name, float v) =>
+        float.IsNaN(v) || v <= 0.01f ? $"{name} —" : $"{name} {v:0.0} °C";
+}
+
+public sealed class MainboardLegendUi : ObservableObject
+{
+    private string _key = "";
+    private string _text = "";
+    private Brush _brush = Brushes.Black;
+
+    public string Key { get => _key; set => Set(ref _key, value); }
+    public string Text { get => _text; set => Set(ref _text, value); }
+    public Brush Brush { get => _brush; set => Set(ref _brush, value); }
+}
+
+public sealed class MainboardFanUi : ObservableObject
+{
+    private string _name = "";
+    private string _rpmText = "—";
+
+    public string Name { get => _name; set => Set(ref _name, value); }
+    public string RpmText { get => _rpmText; set => Set(ref _rpmText, value); }
+}

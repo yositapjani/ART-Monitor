@@ -1,0 +1,158 @@
+﻿using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Media;
+using System.Windows.Shapes;
+using HwFanControl.App.Services;
+
+namespace HwFanControl.App.Controls;
+
+public sealed class HdTempGraphCanvas : Canvas
+{
+    private HdTempViewModel? _model;
+
+    public void Bind(HdTempViewModel model)
+    {
+        _model = model;
+        Redraw();
+    }
+
+    public void Redraw()
+    {
+        Children.Clear();
+        if (_model is null || ActualWidth < 40 || ActualHeight < 40)
+            return;
+
+        double w = ActualWidth;
+        double h = ActualHeight;
+        double padL = 32, padR = 6, padT = 18, padB = 6;
+        double plotW = w - padL - padR;
+        double plotH = h - padT - padB;
+        float ymin = _model.AxisMin;
+        float ymax = _model.AxisMax;
+        if (ymax <= ymin) ymax = ymin + 20;
+
+        Children.Add(new Rectangle { Width = w, Height = h, Fill = ThemeService.GraphBg });
+
+        var title = new TextBlock
+        {
+            Text = "°C",
+            FontSize = 11,
+            Foreground = ThemeService.GraphInk,
+            FontWeight = FontWeights.SemiBold,
+        };
+        SetLeft(title, padL);
+        SetTop(title, 2);
+        Children.Add(title);
+
+        // Label every 5 °C; dashed grid at those ticks (Argus HD Temp.).
+        float step = 5f;
+        for (float val = ymin; val <= ymax + 0.01f; val += step)
+        {
+            double y = padT + plotH * (1.0 - (val - ymin) / (ymax - ymin));
+            Children.Add(new Line
+            {
+                X1 = padL,
+                Y1 = y,
+                X2 = w - padR,
+                Y2 = y,
+                Stroke = ThemeService.GraphInk,
+                StrokeThickness = 1,
+                StrokeDashArray = new DoubleCollection { 2, 2 },
+                Opacity = 0.55,
+            });
+            var label = new TextBlock { Text = $"{val:0}", FontSize = 10, Foreground = ThemeService.GraphInk };
+            SetLeft(label, 4);
+            SetTop(label, y - 7);
+            Children.Add(label);
+        }
+
+        var border = new Rectangle
+        {
+            Width = plotW,
+            Height = plotH,
+            Stroke = ThemeService.GraphInk,
+            StrokeThickness = 1,
+            Fill = Brushes.Transparent,
+        };
+        SetLeft(border, padL);
+        SetTop(border, padT);
+        Children.Add(border);
+
+        int colorIdx = 0;
+        foreach (var legend in _model.Legend)
+        {
+            if (!_model.Histories.TryGetValue(legend.Key, out var queue))
+            {
+                colorIdx++;
+                continue;
+            }
+
+            var series = queue.ToArray();
+            var color = _model.ColorForIndex(colorIdx);
+            DrawSeries(series, color, padL, padT, plotW, plotH, ymin, ymax);
+            colorIdx++;
+        }
+
+        var maxLabel = new TextBlock
+        {
+            Text = _model.MaxHddTempText,
+            FontSize = 12,
+            Foreground = Brushes.Red,
+            FontWeight = FontWeights.Normal,
+        };
+        maxLabel.Measure(new System.Windows.Size(double.PositiveInfinity, double.PositiveInfinity));
+        SetLeft(maxLabel, Math.Max(padL, w - padR - maxLabel.DesiredSize.Width - 8));
+        SetTop(maxLabel, padT + plotH - maxLabel.DesiredSize.Height - 4);
+        Children.Add(maxLabel);
+    }
+
+    private void DrawSeries(
+        float[] series, Color color,
+        double padL, double padT, double plotW, double plotH,
+        float ymin, float ymax)
+    {
+        if (series.Length < 2) return;
+
+        var geo = new StreamGeometry();
+        using (var ctx = geo.Open())
+        {
+            bool started = false;
+            for (int i = 0; i < series.Length; i++)
+            {
+                float v = series[i];
+                if (float.IsNaN(v) || v <= 0.01f)
+                {
+                    started = false;
+                    continue;
+                }
+
+                double x = padL + plotW * i / Math.Max(1, HdTempViewModel.HistoryCapacity - 1);
+                double y = padT + plotH * (1.0 - (v - ymin) / (ymax - ymin));
+                var pt = new Point(x, y);
+                if (!started)
+                {
+                    ctx.BeginFigure(pt, false, false);
+                    started = true;
+                }
+                else
+                {
+                    ctx.LineTo(pt, true, false);
+                }
+            }
+        }
+
+        geo.Freeze();
+        Children.Add(new Path
+        {
+            Data = geo,
+            Stroke = new SolidColorBrush(color),
+            StrokeThickness = 2.2,
+        });
+    }
+
+    protected override void OnRenderSizeChanged(SizeChangedInfo sizeInfo)
+    {
+        base.OnRenderSizeChanged(sizeInfo);
+        Redraw();
+    }
+}
